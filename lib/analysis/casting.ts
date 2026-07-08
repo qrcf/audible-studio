@@ -163,7 +163,8 @@ export async function castBatchLlm(
       `Cast ElevenLabs voices for an audiobook of "${book.title}".\n\n` +
       `Rules:\n` +
       `- Assign exactly one voice to every character listed (identify it by its characterRef number), each appearing exactly once. For each, return the chosen voice's voiceRef number AND its matching voiceName, plus a SPECIFIC one-line rationale tied to the character — never filler like "placeholder".\n` +
-      `- Match gender strictly when known, and match age closely (an elderly character must not get a young voice and vice versa); approximate accent.\n` +
+      `- Match gender strictly when known, and match age closely (an elderly character must not get a young voice and vice versa).\n` +
+      `- ACCENT MATTERS: when a character has an accentHint or heritage implying a specific accent (e.g. Jamaican/Caribbean, Irish, Southern-US, Russian), pick a voice whose accent genuinely fits. A confidently WRONG regional accent is a serious miss — never give a Jamaican/Caribbean character a crisp British-RP or plain American voice, an Irish character an American one, etc. If the catalog has no voice in that accent, choose a NEUTRAL or unlabeled voice (or the closest region), NEVER a voice carrying a different strong accent. Explicitly justify the accent choice in the rationale.\n` +
       `- The narrator entry (isNarrator=true) gets the best narration-suited voice (useCase like "narrative_story", calm/neutral) and stability around 0.65.\n` +
       `- The narrator and all "major" characters must each get a DISTINCT voice not in ALREADY CAST. "minor" characters may reuse each other's voices (never a major character's or the narrator's) when there aren't enough matching voices.\n` +
       `- Weigh heritage, accentHint, and voiceTexture heavily against each voice's accent, style, and description; heritage implies an accent only when the text supports it.\n` +
@@ -306,7 +307,34 @@ function voiceAgeBucket(age: string | null): "young" | "middle" | "old" | null {
   return null;
 }
 
-/** Deterministic pick honouring gender + age compatibility, preferring unused voices. */
+/**
+ * Coarse accent family from free-form accent/heritage text, so the fallback
+ * doesn't undo the model's accent work by handing (say) a Jamaican character
+ * a British voice. Returns null for unlabeled/neutral text.
+ */
+function accentFamily(text: string | null | undefined): string | null {
+  const t = (text ?? "").toLowerCase();
+  if (!t) return null;
+  if (/jamaic|caribbean|trinidad|bajan|west indian|creole/.test(t)) return "caribbean";
+  if (/irish|ireland/.test(t)) return "irish";
+  if (/scottish|scotland|glasw/.test(t)) return "scottish";
+  if (/welsh|wales/.test(t)) return "welsh";
+  if (/australia|aussie|new zealand|kiwi/.test(t)) return "australian";
+  if (/british|england|\benglish\b|london|cockney|yorkshire|received pronunciation|\brp\b/.test(t))
+    return "british";
+  if (/american|\bu\.?s\.?\b|southern us|new york|texan|californ|midwest|canadian/.test(t))
+    return "american";
+  if (/india|indian/.test(t)) return "indian";
+  if (/french|france/.test(t)) return "french";
+  if (/german|germany/.test(t)) return "german";
+  if (/russian|russia|slavic/.test(t)) return "russian";
+  if (/spanish|spain|mexic|latin|hispanic/.test(t)) return "spanish";
+  if (/italian|italy/.test(t)) return "italian";
+  if (/african|nigeria|ghana|kenya|south africa/.test(t)) return "african";
+  return null;
+}
+
+/** Deterministic pick honouring gender + age + accent compatibility, preferring unused voices. */
 function fallbackVoice(
   voices: VoiceProfile[],
   character: CharacterRow,
@@ -314,6 +342,8 @@ function fallbackVoice(
 ): VoiceProfile {
   const gender = character.profile.gender;
   const charAge = characterAgeBucket(character.profile.ageRange);
+  const charAccent =
+    accentFamily(character.profile.accentHint) ?? accentFamily(character.profile.heritage);
   const genderOk = (v: VoiceProfile) =>
     !v.gender || gender === "unknown" || gender === "nonbinary" || v.gender === gender;
   const ageOk = (v: VoiceProfile) => {
@@ -324,7 +354,15 @@ function fallbackVoice(
       (charAge === "young" && voiceAge === "old")
     );
   };
+  // Exact accent match; otherwise a neutral/unlabeled voice — but never a
+  // voice carrying a DIFFERENT strong accent (that's the whole point).
+  const accentExact = (v: VoiceProfile) => charAccent !== null && accentFamily(v.accent) === charAccent;
+  const accentOk = (v: VoiceProfile) => charAccent === null || accentFamily(v.accent) === null || accentExact(v);
   const pools = [
+    voices.filter((v) => genderOk(v) && ageOk(v) && accentExact(v) && !taken.has(v.id)),
+    voices.filter((v) => genderOk(v) && ageOk(v) && accentExact(v)),
+    voices.filter((v) => genderOk(v) && ageOk(v) && accentOk(v) && !taken.has(v.id)),
+    voices.filter((v) => genderOk(v) && ageOk(v) && accentOk(v)),
     voices.filter((v) => genderOk(v) && ageOk(v) && !taken.has(v.id)),
     voices.filter((v) => genderOk(v) && ageOk(v)),
     voices.filter((v) => genderOk(v) && !taken.has(v.id)),

@@ -1,22 +1,14 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Loader2, RefreshCw, Settings2 } from "lucide-react";
 import { toast } from "sonner";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Slider } from "@/components/ui/slider";
 import {
@@ -37,6 +29,8 @@ import type { VoiceSettings } from "@/lib/db/schema";
 import { PreviewButton, fetchPreviewUrl } from "./preview-button";
 import { useReadOnly } from "./read-only";
 import type { CharacterData, VoiceData } from "./types";
+import { ProfileTooltipBody } from "./profile-tooltip";
+import { VoiceCombobox } from "./voice-combobox";
 
 type CatalogState =
   | { status: "loading" }
@@ -60,9 +54,6 @@ export function VoicesTab({
 }) {
   const router = useRouter();
   const readOnly = useReadOnly();
-  const [gender, setGender] = useState("any");
-  const [accent, setAccent] = useState("any");
-  const [search, setSearch] = useState("");
   const [saving, setSaving] = useState<string | null>(null);
   const [loaded, setLoaded] = useState<{ key: number; state: CatalogState } | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
@@ -100,24 +91,6 @@ export function VoicesTab({
   const catalog: CatalogState =
     loaded && loaded.key === reloadKey ? loaded.state : { status: "loading" };
   const voices = catalog.status === "ready" ? catalog.voices : NO_VOICES;
-
-  const accents = useMemo(
-    () => [...new Set(voices.map((v) => v.accent).filter((a): a is string => Boolean(a)))].sort(),
-    [voices]
-  );
-
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return voices.filter(
-      (v) =>
-        (gender === "any" || v.gender === gender) &&
-        (accent === "any" || v.accent === accent) &&
-        (!q ||
-          v.name.toLowerCase().includes(q) ||
-          (v.descriptive ?? "").toLowerCase().includes(q) ||
-          (v.description ?? "").toLowerCase().includes(q))
-    );
-  }, [voices, gender, accent, search]);
 
   if (!elevenReady) {
     return (
@@ -193,46 +166,15 @@ export function VoicesTab({
     <TooltipProvider>
     <div className="space-y-4">
       {!readOnly && (
-      <div className="flex flex-wrap items-center gap-2">
-        <Input
-          placeholder="Filter voices…"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          className="w-44"
-        />
-        <Select value={gender} onValueChange={setGender}>
-          <SelectTrigger className="w-32">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="any">Any gender</SelectItem>
-            <SelectItem value="male">Male</SelectItem>
-            <SelectItem value="female">Female</SelectItem>
-          </SelectContent>
-        </Select>
-        <Select value={accent} onValueChange={setAccent}>
-          <SelectTrigger className="w-40">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="any">Any accent</SelectItem>
-            {accents.map((a) => (
-              <SelectItem key={a} value={a}>
-                {a}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <div className="ml-auto">
-          <Button variant="outline" onClick={onRecast} disabled={busy}>
-            {casting ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <RefreshCw className="h-4 w-4" />
-            )}
-            Re-run auto-cast
-          </Button>
-        </div>
+      <div className="flex items-center justify-end">
+        <Button variant="outline" onClick={onRecast} disabled={busy}>
+          {casting ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <RefreshCw className="h-4 w-4" />
+          )}
+          Re-run auto-cast
+        </Button>
       </div>
       )}
 
@@ -249,14 +191,6 @@ export function VoicesTab({
           <TableBody>
             {characters.map((c) => {
               const assigned = c.assignment;
-              const options = assigned
-                ? [
-                    ...filtered,
-                    ...(filtered.some((v) => v.id === assigned.voiceId)
-                      ? []
-                      : voices.filter((v) => v.id === assigned.voiceId)),
-                  ]
-                : filtered;
               const assignedVoice = voices.find((v) => v.id === assigned?.voiceId);
               const quote = c.quotes[0];
 
@@ -292,20 +226,8 @@ export function VoicesTab({
                           </div>
                         </div>
                       </TooltipTrigger>
-                      <TooltipContent className="max-w-sm space-y-1">
-                        <p>{c.profile.personality}</p>
-                        {c.profile.speechStyle && (
-                          <p className="text-muted-foreground">Speech: {c.profile.speechStyle}</p>
-                        )}
-                        {c.profile.heritage && (
-                          <p className="text-muted-foreground">Heritage: {c.profile.heritage}</p>
-                        )}
-                        {c.profile.accentHint && (
-                          <p className="text-muted-foreground">Accent: {c.profile.accentHint}</p>
-                        )}
-                        {c.profile.voiceTexture && (
-                          <p className="text-muted-foreground">Voice: {c.profile.voiceTexture}</p>
-                        )}
+                      <TooltipContent className="max-w-sm">
+                        <ProfileTooltipBody profile={c.profile} />
                       </TooltipContent>
                     </Tooltip>
                   </TableCell>
@@ -316,36 +238,14 @@ export function VoicesTab({
                       </span>
                     ) : (
                     <div className="flex min-w-0 items-center gap-1.5">
-                      <Select
-                        value={assigned?.voiceId ?? ""}
-                        onValueChange={(v) => changeVoice(c.id, v)}
-                        disabled={saving === c.id || voices.length === 0}
-                      >
-                        <SelectTrigger className="w-full min-w-0">
-                          {saving === c.id ? (
-                            <Loader2 className="h-4 w-4 animate-spin" />
-                          ) : assigned ? (
-                            <span
-                              className="min-w-0 truncate"
-                              title={assignedVoice?.name ?? assigned.voiceName}
-                            >
-                              {assignedVoice?.name ?? assigned.voiceName}
-                            </span>
-                          ) : (
-                            <SelectValue placeholder="Pick a voice" />
-                          )}
-                        </SelectTrigger>
-                        <SelectContent>
-                          {options.map((v) => (
-                            <SelectItem key={v.id} value={v.id}>
-                              <span>{v.name}</span>
-                              <span className="ml-2 text-xs text-muted-foreground">
-                                {[v.gender, v.age, v.accent].filter(Boolean).join(" · ")}
-                              </span>
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
+                      <VoiceCombobox
+                        voices={voices}
+                        value={assigned?.voiceId}
+                        selectedLabel={assigned?.voiceName}
+                        onChange={(v) => changeVoice(c.id, v)}
+                        disabled={voices.length === 0}
+                        loading={saving === c.id}
+                      />
                       {assigned && (
                         <VoiceSettingsPopover
                           characterId={c.id}

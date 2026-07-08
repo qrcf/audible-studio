@@ -37,6 +37,7 @@ import { EditProfileDialog } from "./edit-profile-dialog";
 import { SplitAgesDialog } from "./split-ages-dialog";
 import { useReadOnly } from "./read-only";
 import type { CharacterData, JobData } from "./types";
+import { ProfileTooltipBody } from "./profile-tooltip";
 
 export function CharactersTab({
   characters,
@@ -216,22 +217,7 @@ export function CharactersTab({
                       </div>
                     </TooltipTrigger>
                     <TooltipContent className="max-w-sm">
-                      <p>{c.profile.personality}</p>
-                      {c.profile.speechStyle && (
-                        <p className="mt-1 text-muted-foreground">
-                          Speech: {c.profile.speechStyle}
-                        </p>
-                      )}
-                      {c.profile.heritage && (
-                        <p className="mt-1 text-muted-foreground">
-                          Heritage: {c.profile.heritage}
-                        </p>
-                      )}
-                      {c.profile.voiceTexture && (
-                        <p className="mt-1 text-muted-foreground">
-                          Voice: {c.profile.voiceTexture}
-                        </p>
-                      )}
+                      <ProfileTooltipBody profile={c.profile} />
                     </TooltipContent>
                   </Tooltip>
                 </TableCell>
@@ -255,12 +241,14 @@ export function CharactersTab({
                           “{c.quotes[0]}”
                         </p>
                       </TooltipTrigger>
-                      <TooltipContent className="max-w-md space-y-1">
-                        {c.quotes.slice(0, 5).map((q, i) => (
-                          <p key={i} className="italic">
-                            “{q}”
-                          </p>
-                        ))}
+                      <TooltipContent className="max-w-md">
+                        <div className="flex flex-col gap-1 text-left">
+                          {c.quotes.slice(0, 5).map((q, i) => (
+                            <p key={i} className="italic leading-snug">
+                              “{q}”
+                            </p>
+                          ))}
+                        </div>
                       </TooltipContent>
                     </Tooltip>
                   ) : (
