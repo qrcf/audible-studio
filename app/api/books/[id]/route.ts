@@ -50,12 +50,14 @@ export async function PATCH(req: Request, { params }: Ctx) {
     const body = (await req.json()) as {
       renderModel?: string;
       title?: string;
+      author?: string | null;
       modelPrefs?: unknown;
       sfxEnabled?: unknown;
     };
     const patch: Partial<{
       renderModel: string;
       title: string;
+      author: string | null;
       modelPrefs: ModelPrefs;
       sfxEnabled: boolean;
     }> = {};
@@ -72,7 +74,15 @@ export async function PATCH(req: Request, { params }: Ctx) {
       patch.sfxEnabled = body.sfxEnabled;
     }
     if (body.modelPrefs !== undefined) patch.modelPrefs = parseModelPrefs(body.modelPrefs);
-    if (body.title) patch.title = body.title;
+    if (body.title !== undefined) {
+      const title = body.title.trim();
+      if (!title) throw new AppError("Title can't be empty", "bad_request");
+      patch.title = title;
+    }
+    if (body.author !== undefined) {
+      const author = typeof body.author === "string" ? body.author.trim() : "";
+      patch.author = author || null;
+    }
     await getDb().update(books).set(patch).where(eq(books.id, id));
     return Response.json({ ok: true });
   } catch (err) {

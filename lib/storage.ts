@@ -28,7 +28,7 @@ export function previewAudioPath(cacheKey: string): string {
   return `previews/${cacheKey}.mp3`;
 }
 
-const AUDIO_PREFIXES = ["segments/", "chapters/", "previews/"];
+const AUDIO_PREFIXES = ["segments/", "chapters/", "previews/", "intro/"];
 
 export function isAudioPathname(pathname: string): boolean {
   return (

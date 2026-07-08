@@ -79,6 +79,11 @@ export const books = pgTable("books", {
   sfxEnabled: boolean("sfx_enabled").notNull().default(true),
   modelPrefs: jsonb("model_prefs").$type<ModelPrefs>(),
   pipelineStage: text("pipeline_stage").$type<PipelineStage>(),
+  // Standalone book intro (music bed + "{Title}, by {Author}") — its own audio
+  // section, NOT concatenated into a chapter, so it can be regenerated on its
+  // own and its sample rate never contaminates chapter playback.
+  introAudioPath: text("intro_audio_path"),
+  introDurationSec: doublePrecision("intro_duration_sec"),
   error: text("error"),
   // Workflow run driving the current book-wide operation, if any
   activeRunId: text("active_run_id"),

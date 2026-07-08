@@ -49,8 +49,8 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     let cursor = 0;
     let anyMatched = false;
 
-    // The book intro (music + title/author) is prepended to the first chapter's
-    // audio but isn't a segment, so start segment timing past it.
+    // The book intro is its own section now (not prepended here), so chapter
+    // segment timing starts at 0. (introDurationSec stays null on chapters.)
     let startSec = chapter.introDurationSec ?? 0;
     const timed = [];
     for (const seg of segs) {

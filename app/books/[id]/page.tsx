@@ -67,6 +67,7 @@ export default async function BookPage({ params }: { params: Promise<{ id: strin
   const bookData: BookData = {
     id: book.id,
     title: book.title,
+    author: book.author,
     status: book.status,
     povType: book.povType,
     narratorProfile: book.narratorProfile,
@@ -75,6 +76,8 @@ export default async function BookPage({ params }: { params: Promise<{ id: strin
     modelPrefs: book.modelPrefs,
     pipelineStage: book.pipelineStage,
     sourceFileName: book.sourceFileName,
+    introAudioPath: book.introAudioPath,
+    introDurationSec: book.introDurationSec,
     error: book.error,
   };
 

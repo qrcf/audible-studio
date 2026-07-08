@@ -13,12 +13,13 @@ export async function GET(_req: Request, { params }: { params: Promise<{ path: s
   if (!isAudioPathname(pathname)) return new Response("Bad path", { status: 400 });
 
   // Share viewers may only reach their own book's audio. Blob paths are
-  // book-scoped (segments/<bookId>/…, chapters/<bookId>/…); previews aren't, so
-  // viewers are denied those outright.
+  // book-scoped (segments/<bookId>/…, chapters/<bookId>/…, intro/<bookId>/…);
+  // previews aren't, so viewers are denied those outright.
   const ctx = await readAuthContext();
   if (ctx?.role === "viewer") {
     const [prefix, bookId] = parts;
-    const scoped = (prefix === "segments" || prefix === "chapters") && bookId === ctx.bookId;
+    const scoped =
+      ["segments", "chapters", "intro"].includes(prefix) && bookId === ctx.bookId;
     if (!scoped) return new Response("Forbidden", { status: 403 });
   }
 

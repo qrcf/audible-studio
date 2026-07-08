@@ -10,6 +10,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { StatusBadge } from "@/components/status-badge";
 import { estimateCredits, formatCredits } from "@/lib/format";
 import { ModelPrefsPopover } from "./model-prefs-popover";
+import { EditBookDialog } from "./edit-book-dialog";
 import { ShareDialog } from "./share-dialog";
 import { ReadOnlyProvider } from "./read-only";
 import { PipelineCard } from "./pipeline-card";
@@ -225,11 +226,13 @@ export function BookView({
     <div className="space-y-6">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
             <h1 className="truncate text-2xl font-semibold tracking-tight">{book.title}</h1>
             <StatusBadge status={liveBookStatus} />
+            {!readOnly && <EditBookDialog book={book} />}
           </div>
           <p className="mt-1 text-sm text-muted-foreground">
+            {book.author ? `by ${book.author} · ` : ""}
             {chapters.length} chapters · {totalChars.toLocaleString()} characters · ~
             {formatCredits(estimateCredits(totalChars, book.renderModel))} credits
             {book.povType ? ` · ${book.povType}-person narration` : ""}

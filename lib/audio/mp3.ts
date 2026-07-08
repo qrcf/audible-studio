@@ -36,6 +36,27 @@ function frameLength(buf: Buffer, offset: number): number | null {
   return Math.floor(((mpeg1 ? 144 : 72) * bitrateKbps * 1000) / sampleRate) + padding;
 }
 
+/** Sample rate (Hz) declared by the first MPEG frame, or null if unreadable. */
+export function firstFrameSampleRate(buf: Buffer): number | null {
+  const b = stripId3(buf);
+  // Scan for the first valid frame sync (some streams have a few junk bytes).
+  for (let off = 0; off < Math.min(b.length - 4, 4096); off++) {
+    if (frameLength(b, off) === null) continue;
+    const b2 = b[off + 1];
+    const b3 = b[off + 2];
+    const versionBits = (b2 >> 3) & 0x03;
+    const sampleIdx = (b3 >> 2) & 0x03;
+    return (
+      versionBits === 3
+        ? [44100, 48000, 32000]
+        : versionBits === 2
+          ? [22050, 24000, 16000]
+          : [11025, 12000, 8000]
+    )[sampleIdx];
+  }
+  return null;
+}
+
 /**
  * Drop a leading Xing/Info/VBRI metadata frame. Every ElevenLabs MP3 starts
  * with one declaring only ITS OWN frame count — after concatenation, players

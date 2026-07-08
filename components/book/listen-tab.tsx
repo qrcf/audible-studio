@@ -1,13 +1,16 @@
 "use client";
 
+import { useRouter } from "next/navigation";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   BookOpenText,
   Download,
   Headphones,
   Loader2,
+  Music,
   Pause,
   Play,
+  RefreshCw,
   RotateCcw,
   RotateCw,
   SkipBack,
@@ -91,11 +94,31 @@ interface ReadalongScript {
   error?: string;
 }
 
+const INTRO_ID = "__intro__";
+
 export function ListenTab({ book, chapters }: { book: BookData; chapters: ChapterMeta[] }) {
   const readOnly = useReadOnly();
-  const playable = chapters.filter(
-    (c) => c.audioPath && (c.status === "ready" || c.status === "stale")
+  const router = useRouter();
+  const [regenIntro, setRegenIntro] = useState(false);
+  const readyChapters = useMemo(
+    () => chapters.filter((c) => c.audioPath && (c.status === "ready" || c.status === "stale")),
+    [chapters]
   );
+  // The book intro plays as its own leading section and streams into chapter 1.
+  const playable = useMemo<ChapterMeta[]>(() => {
+    if (!book.introAudioPath) return readyChapters;
+    const intro: ChapterMeta = {
+      id: INTRO_ID,
+      idx: -1,
+      title: "Intro",
+      charCount: 0,
+      status: "ready",
+      durationSec: book.introDurationSec,
+      audioPath: book.introAudioPath,
+      error: null,
+    };
+    return [intro, ...readyChapters];
+  }, [readyChapters, book.introAudioPath, book.introDurationSec]);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [current, setCurrent] = useState<ChapterMeta | null>(null);
   const [playing, setPlaying] = useState(false);
@@ -169,6 +192,7 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
   // Load the timed script for the current chapter when read-along is on
   useEffect(() => {
     if (!readAlong || !current) return;
+    if (current.id === INTRO_ID) return; // the intro section has no script
     if (script?.chapterId === current.id) return;
     let cancelled = false;
     const chapterId = current.id;
@@ -333,6 +357,21 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
     if (audio) audio.currentTime = Math.max(0, Math.min(audio.duration || 0, audio.currentTime + delta));
   };
 
+  async function regenerateIntro() {
+    setRegenIntro(true);
+    try {
+      const res = await fetch(`/api/books/${book.id}/intro`, { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      toast.success("Intro regenerated — title, author & music");
+      router.refresh();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to regenerate intro");
+    } finally {
+      setRegenIntro(false);
+    }
+  }
+
   return (
     <div className="space-y-4">
       <Card className="sticky top-16 z-30 border-primary/20 bg-card/95 backdrop-blur">
@@ -414,7 +453,7 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
         </CardContent>
       </Card>
 
-      {readAlong && current && (
+      {readAlong && current && current.id !== INTRO_ID && (
         <Card>
           <CardContent className="py-4">
             {!script || script.chapterId !== current.id ? (
@@ -516,7 +555,7 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
 
       <div className="flex items-center justify-between">
         <p className="text-sm text-muted-foreground">
-          {playable.length} of {chapters.length} chapters generated
+          {readyChapters.length} of {chapters.length} chapters generated
         </p>
         {!readOnly && (
         <Button
@@ -555,7 +594,9 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
       </div>
 
       <div className="divide-y rounded-lg border">
-        {playable.map((ch) => (
+        {playable.map((ch) => {
+          const isIntro = ch.id === INTRO_ID;
+          return (
           <div
             key={ch.id}
             className={cn(
@@ -579,9 +620,21 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
               )}
             </Button>
             <div className="min-w-0 flex-1">
-              <p className="truncate text-sm font-medium">
-                {ch.idx + 1}. {ch.title}
-              </p>
+              {isIntro ? (
+                <>
+                  <p className="flex items-center gap-1.5 truncate text-sm font-medium">
+                    <Music className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> Intro
+                  </p>
+                  <p className="truncate text-xs text-muted-foreground">
+                    {book.title}
+                    {book.author ? `, by ${book.author}` : ""}
+                  </p>
+                </>
+              ) : (
+                <p className="truncate text-sm font-medium">
+                  {ch.idx + 1}. {ch.title}
+                </p>
+              )}
             </div>
             {ch.status === "stale" && (
               <Badge variant="outline" className="border-orange-500/50 text-orange-400">
@@ -591,22 +644,40 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
             <span className="font-mono text-xs text-muted-foreground">
               {ch.durationSec ? formatDuration(ch.durationSec) : ""}
             </span>
+            {!readOnly && isIntro && (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8"
+                title="Regenerate title & music"
+                disabled={regenIntro}
+                onClick={regenerateIntro}
+              >
+                {regenIntro ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-4 w-4" />
+                )}
+              </Button>
+            )}
             {!readOnly && (
               <Button
                 variant="ghost"
                 size="icon"
                 className="h-8 w-8"
                 onClick={() =>
-                  saveAudio(ch.audioPath!, `${ch.idx + 1} - ${ch.title}.mp3`).catch(() =>
-                    toast.error("Download failed")
-                  )
+                  saveAudio(
+                    ch.audioPath!,
+                    isIntro ? "00 - Intro.mp3" : `${ch.idx + 1} - ${ch.title}.mp3`
+                  ).catch(() => toast.error("Download failed"))
                 }
               >
                 <Download className="h-4 w-4" />
               </Button>
             )}
           </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );

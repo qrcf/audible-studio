@@ -5,6 +5,7 @@ import type { ModelPrefs } from "@/lib/llm-models";
 export interface BookData {
   id: string;
   title: string;
+  author: string | null;
   status: string;
   povType: "first" | "third" | null;
   narratorProfile: NarratorProfile | null;
@@ -13,6 +14,8 @@ export interface BookData {
   modelPrefs: ModelPrefs | null;
   pipelineStage: string | null;
   sourceFileName: string;
+  introAudioPath: string | null;
+  introDurationSec: number | null;
   error: string | null;
 }
 

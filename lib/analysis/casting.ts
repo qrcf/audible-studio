@@ -1,33 +1,50 @@
 import { randomUUID, randomInt } from "node:crypto";
 import { eq, inArray } from "drizzle-orm";
-import { generateObject } from "ai";
+import { generateText, stepCountIs, tool } from "ai";
 import { z } from "zod";
 import { getDb, books, characters, voiceAssignments } from "@/lib/db";
 import { getModel } from "@/lib/llm";
-import { getVoiceCatalog, type VoiceProfile } from "@/lib/elevenlabs/catalog";
+import { getVoiceCatalog, searchSharedVoices, type VoiceProfile } from "@/lib/elevenlabs/catalog";
 import { NARRATOR_SETTINGS, DEFAULT_SETTINGS } from "@/lib/elevenlabs/tts";
 import { AppError } from "@/lib/errors";
 
 export const CAST_BATCH = 8;
 
-const castingSchema = z.object({
-  assignments: z.array(
-    z.object({
-      characterRef: z.number().int().describe("The character's number from CHARACTERS TO CAST NOW"),
-      voiceRef: z.number().int().describe("The chosen voice's number from AVAILABLE VOICES"),
-      voiceName: z.string().describe("Name of the chosen voice — must match the voice at voiceRef"),
-      rationale: z.string().describe("One line: why this voice fits this character"),
-      stability: z
-        .number()
-        .min(0)
-        .max(1)
-        .describe("Lower (~0.35) for volatile/emotional characters, higher (~0.65) for steady ones and the narrator"),
-      speed: z.number().min(0.85).max(1.1).describe("1.0 unless the character is notably fast/slow spoken"),
-    })
-  ),
-});
+// One model pick, captured from the assignVoice tool.
+interface CastPick {
+  voiceId: string;
+  voiceName: string;
+  stability: number;
+  speed: number;
+  rationale: string;
+}
 
 const normalizeName = (name: string) => name.trim().toLowerCase();
+
+const VOICE_SEARCH_LIMIT = 14;
+
+/** Filter the full catalog to a small, relevant shortlist for one search. */
+function searchCatalog(
+  voices: VoiceProfile[],
+  q: { gender?: string; accent?: string; age?: string; query?: string; limit?: number }
+): VoiceProfile[] {
+  const gender = q.gender?.toLowerCase();
+  const accent = q.accent?.toLowerCase().trim();
+  const age = q.age?.toLowerCase();
+  const query = q.query?.toLowerCase().trim();
+  const ageBucket = (v: VoiceProfile) => voiceAgeBucket(v.age);
+  const matches = voices.filter((v) => {
+    if (gender && gender !== "neutral" && v.gender && v.gender.toLowerCase() !== gender) return false;
+    if (accent && !(v.accent ?? "").toLowerCase().includes(accent)) return false;
+    if (age && ageBucket(v) && ageBucket(v) !== age) return false;
+    if (query) {
+      const hay = `${v.name} ${v.descriptive ?? ""} ${v.description ?? ""} ${v.useCase ?? ""} ${v.accent ?? ""}`.toLowerCase();
+      if (!hay.includes(query)) return false;
+    }
+    return true;
+  });
+  return matches.slice(0, Math.min(q.limit ?? VOICE_SEARCH_LIMIT, 25));
+}
 
 export interface AlreadyCastEntry {
   name: string;
@@ -127,24 +144,17 @@ export async function castBatchLlm(
   const batch = batchIds.map((id) => byId.get(id)).filter((c) => c !== undefined);
 
   const voices = await getVoiceCatalog();
-  // The model returns 1-based refs (indexes) instead of opaque ElevenLabs ids —
-  // LLMs copy small integers reliably but mangle random 20-char id strings.
-  // voiceName is a semantic cross-check so a wrong ref self-corrects by name.
+  // A model-reported voiceName is matched against the FULL catalog so a choice
+  // still resolves even if the copied id is slightly off.
   const voicesByNormName = new Map<string, VoiceProfile>();
   for (const v of voices) {
     const key = normalizeName(v.name);
     if (!voicesByNormName.has(key)) voicesByNormName.set(key, v);
   }
-  const voiceInput = voices.map((v, i) => ({
-    ref: i + 1,
-    name: v.name,
-    gender: v.gender,
-    age: v.age,
-    accent: v.accent,
-    style: v.descriptive,
-    useCase: v.useCase,
-    description: v.description?.slice(0, 180),
-  }));
+  const accents = [...new Set(voices.map((v) => v.accent).filter(Boolean))].sort();
+  // Every voice the model is shown (cache + live results) so its final pick
+  // resolves even when it chose a live-only voice outside the cached slice.
+  const seen = new Map(voices.map((v) => [v.id, v]));
 
   const batchInput = batch.map((c, i) => ({
     ref: i + 1,
@@ -156,26 +166,108 @@ export async function castBatchLlm(
     ...c.profile,
   }));
 
-  const { object } = await generateObject({
+  // The catalog is hundreds of voices — NEVER dumped into the prompt. The model
+  // SEARCHES it per character (by accent/gender/age) to pull a tight, relevant
+  // shortlist, then records each choice via assignVoice.
+  const picks = new Map<number, CastPick>();
+  await generateText({
     model: getModel("cast", book.modelPrefs),
-    schema: castingSchema,
+    stopWhen: stepCountIs(batch.length * 3 + 6),
+    tools: {
+      searchVoices: tool({
+        description:
+          "Search the ElevenLabs voice catalog. Filter by gender, accent (a label like 'jamaican', 'irish', 'nigerian', 'southern'), age, and/or free text. Returns up to ~14 matching voices with exact voiceId + voiceName. You may call it several times, or in parallel for several characters.",
+        inputSchema: z.object({
+          gender: z.enum(["male", "female", "neutral"]).optional(),
+          accent: z
+            .string()
+            .optional()
+            .describe(`Available accents: ${accents.join(", ")}`),
+          age: z.enum(["young", "middle", "old"]).optional(),
+          query: z.string().optional().describe("Free-text match against name/description/style"),
+          limit: z.number().int().min(1).max(25).optional(),
+        }),
+        execute: async (q) => {
+          // Live shared library (all accents) + the cached slice (incl. the
+          // account's own premades), deduped, then age-filtered client-side.
+          let live: VoiceProfile[] = [];
+          try {
+            live = await searchSharedVoices({
+              gender: q.gender,
+              accent: q.accent,
+              query: q.query,
+              limit: q.limit,
+            });
+          } catch {
+            // fall back to the cache alone if the live search fails
+          }
+          const merged = new Map<string, VoiceProfile>();
+          for (const v of [...live, ...searchCatalog(voices, q)]) {
+            if (v.id && !merged.has(v.id)) merged.set(v.id, v);
+          }
+          let found = [...merged.values()];
+          if (q.age) found = found.filter((v) => !voiceAgeBucket(v.age) || voiceAgeBucket(v.age) === q.age);
+          found = found.slice(0, Math.min(q.limit ?? VOICE_SEARCH_LIMIT, 25));
+          for (const v of found) seen.set(v.id, v);
+          return {
+            count: found.length,
+            voices: found.map((v) => ({
+              voiceId: v.id,
+              voiceName: v.name,
+              gender: v.gender,
+              age: v.age,
+              accent: v.accent,
+              style: v.descriptive,
+              useCase: v.useCase,
+              description: v.description?.slice(0, 160),
+            })),
+          };
+        },
+      }),
+      assignVoice: tool({
+        description:
+          "Record the final voice for ONE character. Call exactly once per character ref, after searching. Copy voiceId + voiceName verbatim from a searchVoices result.",
+        inputSchema: z.object({
+          characterRef: z.number().int().describe("The character's ref number"),
+          voiceId: z.string().describe("voiceId copied verbatim from a searchVoices result"),
+          voiceName: z.string().describe("The matching voiceName"),
+          stability: z
+            .number()
+            .min(0)
+            .max(1)
+            .describe("~0.35 for volatile/emotional characters, ~0.65 for steady voices and the narrator"),
+          speed: z.number().min(0.85).max(1.1).describe("1.0 unless notably fast/slow spoken"),
+          rationale: z
+            .string()
+            .describe("One specific line on why this voice fits — name the accent match"),
+        }),
+        execute: async (p) => {
+          picks.set(p.characterRef, {
+            voiceId: p.voiceId,
+            voiceName: p.voiceName,
+            stability: p.stability,
+            speed: p.speed,
+            rationale: p.rationale,
+          });
+          return "recorded";
+        },
+      }),
+    },
     prompt:
-      `Cast ElevenLabs voices for an audiobook of "${book.title}".\n\n` +
+      `Cast ElevenLabs voices for an audiobook of "${book.title}". Work character by character; you MUST call assignVoice exactly once for every character ref below.\n\n` +
+      `For each character: read its profile, then call searchVoices with the fitting gender + accent, then assignVoice with the best result's exact voiceId + voiceName.\n\n` +
       `Rules:\n` +
-      `- Assign exactly one voice to every character listed (identify it by its characterRef number), each appearing exactly once. For each, return the chosen voice's voiceRef number AND its matching voiceName, plus a SPECIFIC one-line rationale tied to the character — never filler like "placeholder".\n` +
-      `- Match gender strictly when known, and match age closely (an elderly character must not get a young voice and vice versa).\n` +
-      `- ACCENT MATTERS: when a character has an accentHint or heritage implying a specific accent (e.g. Jamaican/Caribbean, Irish, Southern-US, Russian), pick a voice whose accent genuinely fits. A confidently WRONG regional accent is a serious miss — never give a Jamaican/Caribbean character a crisp British-RP or plain American voice, an Irish character an American one, etc. If the catalog has no voice in that accent, choose a NEUTRAL or unlabeled voice (or the closest region), NEVER a voice carrying a different strong accent. Explicitly justify the accent choice in the rationale.\n` +
-      `- The narrator entry (isNarrator=true) gets the best narration-suited voice (useCase like "narrative_story", calm/neutral) and stability around 0.65.\n` +
-      `- The narrator and all "major" characters must each get a DISTINCT voice not in ALREADY CAST. "minor" characters may reuse each other's voices (never a major character's or the narrator's) when there aren't enough matching voices.\n` +
-      `- Weigh heritage, accentHint, and voiceTexture heavily against each voice's accent, style, and description; heritage implies an accent only when the text supports it.\n` +
+      `- ACCENT MATTERS most. Map heritage/accentHint to a real accent label (Jamaican/Caribbean → "jamaican", Irish → "irish", Deep-South American → "southern", Russian émigré → "russian"). A confidently WRONG regional accent is a serious miss — never give a Jamaican character a British-RP or plain American voice, an Irish character an American one, etc. If no voice in the needed accent exists, search for a NEUTRAL/unlabeled one (or the closest region) — NEVER a voice carrying a different strong accent.\n` +
+      `- Match gender strictly when known; match age closely (no young voice for an elderly character or vice versa).\n` +
+      `- The narrator (isNarrator=true) gets a calm narration-suited voice (useCase like "narrative_story") and stability ~0.65.\n` +
+      `- The narrator and every "major" character must get a DISTINCT voice, not one in ALREADY CAST. "minor" characters may share a voice with each other (never a major's or the narrator's) if needed.\n` +
       (hasVariants
-        ? `- Characters sharing a variantGroup are ONE person at different life stages: give each a DIFFERENT voice, but keep gender and accent consistent and pick voices that plausibly sound like the same person younger/older.\n`
+        ? `- Characters sharing a variantGroup are ONE person at different life stages: give each a DIFFERENT voice but keep gender and accent consistent, plausibly the same person younger/older.\n`
         : "") +
       `\nCHARACTERS TO CAST NOW (each has a ref number):\n${JSON.stringify(batchInput)}\n\n` +
       (alreadyCast.length > 0
-        ? `ALREADY CAST (fixed — do not reassign these voices to narrator/major characters; keep new picks consistent, especially same-variantGroup siblings):\n${JSON.stringify(alreadyCast)}\n\n`
-        : "") +
-      `AVAILABLE VOICES (each has a ref number):\n${JSON.stringify(voiceInput)}`,
+        ? `ALREADY CAST (fixed — don't reuse these voices for narrator/major characters; keep same-variantGroup siblings consistent):\n${JSON.stringify(alreadyCast)}\n`
+        : ""),
   });
 
   const nextAlreadyCast = [...alreadyCast];
@@ -183,16 +275,19 @@ export async function castBatchLlm(
   const rows: AssignmentRow[] = [];
   for (let i = 0; i < batch.length; i++) {
     const character = batch[i];
-    const pick = object.assignments.find((a) => a.characterRef === i + 1);
-    let voice = pick && Number.isInteger(pick.voiceRef) ? voices[pick.voiceRef - 1] : undefined;
-    // Self-correct: if the ref is out of range or its name disagrees with the
-    // model's stated voiceName, trust the name (that's the model's real intent).
+    const pick = picks.get(i + 1);
+    // Resolve against everything the model saw (cache + live search results).
+    let voice = pick ? seen.get(pick.voiceId) : undefined;
+    // Self-correct: if the id didn't resolve or its name disagrees, trust the
+    // reported voiceName (that's the model's real intent).
     if (pick && (!voice || normalizeName(voice.name) !== normalizeName(pick.voiceName))) {
-      const byName = voicesByNormName.get(normalizeName(pick.voiceName));
+      const byName =
+        voicesByNormName.get(normalizeName(pick.voiceName)) ??
+        [...seen.values()].find((v) => normalizeName(v.name) === normalizeName(pick.voiceName));
       if (byName) voice = byName;
     }
     const problem = !pick
-      ? "missing from response"
+      ? "not assigned"
       : !voice
         ? "unknown voice"
         : validatePick(character, voice, pick.rationale);

@@ -12,7 +12,7 @@ import {
 } from "@/lib/generation";
 import { ttsConvert, splitForModel } from "@/lib/elevenlabs/tts";
 import { soundEffect } from "@/lib/elevenlabs/sfx";
-import { generateMusic, INTRO_MUSIC_PROMPT } from "@/lib/elevenlabs/music";
+import { ensureBookIntro } from "@/lib/intro";
 import { estimateSfxCredits } from "@/lib/format";
 import { concatMp3, segmentAudioDurationSec } from "@/lib/audio/mp3";
 import { isV3, pauseSuffix } from "@/lib/delivery";
@@ -260,61 +260,15 @@ export async function renderBatch(
   };
 }
 
-/**
- * Book intro for the first real chapter: cheesy music then the narrator
- * reading "{Title}, by {Author}." Returns the composed audio (cached per
- * book/title/author/voice) or null when this chapter isn't the intro chapter.
- * The intro isn't a segment — its duration is returned so read-along can
- * offset the chapter's segment start times past it.
- */
-async function buildBookIntro(chapter: typeof chapters.$inferSelect): Promise<Buffer | null> {
-  const db = getDb();
-  const bookChapters = await db
+/** True when this chapter is the one the standalone book intro should precede. */
+async function isFirstRealChapter(chapter: typeof chapters.$inferSelect): Promise<boolean> {
+  const bookChapters = await getDb()
     .select({ id: chapters.id, idx: chapters.idx, title: chapters.title })
     .from(chapters)
     .where(eq(chapters.bookId, chapter.bookId))
     .orderBy(asc(chapters.idx));
   const firstReal = bookChapters.find((c) => c.title !== "Front Matter") ?? bookChapters[0];
-  if (!firstReal || firstReal.id !== chapter.id) return null;
-
-  const [book] = await db.select().from(books).where(eq(books.id, chapter.bookId)).limit(1);
-  if (!book) return null;
-  const { resolve } = await getAssignmentResolver(chapter.bookId);
-  const narrator = resolve(null);
-  if (!narrator) return null; // narrator uncast — skip the intro rather than fail
-
-  const introText = book.author ? `${book.title}, by ${book.author}.` : `${book.title}.`;
-  const key = createHash("sha256")
-    .update(
-      JSON.stringify([
-        book.title,
-        book.author ?? "",
-        narrator.voiceId,
-        narrator.settings,
-        book.renderModel,
-        "intro-v1",
-      ])
-    )
-    .digest("hex")
-    .slice(0, 16);
-  const introPath = `intro/${book.id}/${key}.mp3`;
-
-  const cached = await readBlobIfExists(introPath);
-  if (cached) return cached;
-
-  const music = await withElevenRetry(() => generateMusic(INTRO_MUSIC_PROMPT, 8000));
-  const voice = await withElevenRetry(() =>
-    ttsConvert({
-      voiceId: narrator.voiceId,
-      text: introText,
-      modelId: book.renderModel,
-      settings: narrator.settings,
-      seed: narrator.seed,
-    })
-  );
-  const intro = concatMp3([music, voice.audio]).data;
-  await writeAudio(introPath, intro);
-  return intro;
+  return firstReal?.id === chapter.id;
 }
 
 /** Concatenate the rendered segments into the chapter mp3 and mark it ready. */
@@ -335,21 +289,31 @@ export async function finalizeChapter(chapterId: string, jobId: string): Promise
     buffers.push(await readAudio(seg.audioPath));
   }
 
-  const intro = await buildBookIntro(chapter);
-  const introDurationSec = intro ? segmentAudioDurationSec(intro) : null;
-  const { data, durationSec } = concatMp3(intro ? [intro, ...buffers] : buffers);
+  // Chapter audio is speech segments only — the intro is its own section.
+  const { data, durationSec } = concatMp3(buffers);
   const contentHash = createHash("sha256").update(data).digest("hex").slice(0, 12);
   const chapterRel = chapterAudioPath(chapter.bookId, chapter.idx, contentHash);
   await writeAudio(chapterRel, data);
 
   await db
     .update(chapters)
-    .set({ status: "ready", audioPath: chapterRel, durationSec, introDurationSec, error: null })
+    .set({ status: "ready", audioPath: chapterRel, durationSec, introDurationSec: null, error: null })
     .where(eq(chapters.id, chapterId));
   // The old version is unreachable once the row points at the new blob
   if (chapter.audioPath && chapter.audioPath !== chapterRel) {
     await deleteBlobs(chapter.audioPath);
   }
+
+  // Build the standalone book-intro section once, off the first real chapter.
+  // Best-effort: a music/voice hiccup must never fail the chapter itself.
+  if (await isFirstRealChapter(chapter)) {
+    try {
+      await ensureBookIntro(chapter.bookId);
+    } catch (err) {
+      console.warn(`Book intro generation failed for ${chapter.bookId}:`, err);
+    }
+  }
+
   await completeJob(jobId);
   await refreshBookStatus(chapter.bookId);
 }
