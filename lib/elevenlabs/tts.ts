@@ -65,11 +65,19 @@ export async function ttsConvert(req: TtsRequest): Promise<TtsResult> {
         speed: req.settings.speed,
         use_speaker_boost: true,
       },
-      ...(req.previousText ? { previous_text: req.previousText } : {}),
-      ...(req.nextText ? { next_text: req.nextText } : {}),
+      // v3 rejects every cross-request continuity field — prosody conditioning
+      // (previous/next_text) AND request stitching (previous/next_request_ids)
+      // both 400 with "unsupported_model" (probed live 2026-07-08). ElevenLabs'
+      // recommended substitute for v3 is a deterministic `seed` (below), which
+      // keeps the voice identity consistent across the concatenated segments;
+      // v3's per-request char limit (4.5k) also exceeds our narration split
+      // (2.8k), so segments almost never split mid-request in the first place.
+      ...(!v3 && req.previousText ? { previous_text: req.previousText } : {}),
+      ...(!v3 && req.nextText ? { next_text: req.nextText } : {}),
       ...(!v3 && req.previousRequestIds?.length
         ? { previous_request_ids: req.previousRequestIds.slice(-3) }
         : {}),
+      // Continuity lever for every model (v3-supported, probed live).
       ...(req.seed !== undefined ? { seed: req.seed } : {}),
       ...(v3 ? {} : { apply_text_normalization: "auto" }),
     }
