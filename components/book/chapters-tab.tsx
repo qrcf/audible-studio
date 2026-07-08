@@ -23,6 +23,7 @@ import {
 import { StatusBadge } from "@/components/status-badge";
 import { estimateCredits, formatCredits, formatDuration } from "@/lib/format";
 import { ScriptSheet } from "./script-sheet";
+import { useReadOnly } from "./read-only";
 import type { ApiKeysPresent, BookData, ChapterMeta, CharacterData, JobData } from "./types";
 
 export function ChaptersTab({
@@ -43,6 +44,7 @@ export function ChaptersTab({
   onGenerateAll: () => void;
 }) {
   const router = useRouter();
+  const readOnly = useReadOnly();
   const [scriptOpen, setScriptOpen] = useState<ChapterMeta | null>(null);
   const [pending, setPending] = useState<string | null>(null);
 
@@ -67,15 +69,17 @@ export function ChaptersTab({
   return (
     <TooltipProvider>
       <div className="space-y-4">
-        <div className="flex items-center justify-between">
-          <p className="text-sm text-muted-foreground">
-            Scripting splits a chapter into narrator and character lines; generation renders
-            each line with its cast voice and stitches the chapter MP3.
-          </p>
-          <Button onClick={onGenerateAll} disabled={busy || !hasCast || !keys.eleven}>
-            <Play className="h-4 w-4" /> Generate all
-          </Button>
-        </div>
+        {!readOnly && (
+          <div className="flex items-center justify-between">
+            <p className="text-sm text-muted-foreground">
+              Scripting splits a chapter into narrator and character lines; generation renders
+              each line with its cast voice and stitches the chapter MP3.
+            </p>
+            <Button onClick={onGenerateAll} disabled={busy || !hasCast || !keys.eleven}>
+              <Play className="h-4 w-4" /> Generate all
+            </Button>
+          </div>
+        )}
 
         <div className="rounded-lg border">
           <Table>
@@ -141,21 +145,23 @@ export function ChaptersTab({
                               {job.note ?? `${job.done}/${job.total}`}
                             </p>
                           </div>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                className="h-6 w-6 shrink-0 text-muted-foreground"
-                                onClick={() =>
-                                  post(`/api/jobs/${job.id}/cancel`, ch.id, "Cancelling…")
-                                }
-                              >
-                                <X className="h-3.5 w-3.5" />
-                              </Button>
-                            </TooltipTrigger>
-                            <TooltipContent>Cancel</TooltipContent>
-                          </Tooltip>
+                          {!readOnly && (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-6 w-6 shrink-0 text-muted-foreground"
+                                  onClick={() =>
+                                    post(`/api/jobs/${job.id}/cancel`, ch.id, "Cancelling…")
+                                  }
+                                >
+                                  <X className="h-3.5 w-3.5" />
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>Cancel</TooltipContent>
+                            </Tooltip>
+                          )}
                         </div>
                       ) : (
                         <span className="text-xs text-muted-foreground">—</span>
@@ -178,43 +184,47 @@ export function ChaptersTab({
                             <TooltipContent>View script</TooltipContent>
                           </Tooltip>
                         )}
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={chapterBusy || rowPending || !keys.anthropic}
-                          onClick={() =>
-                            post(
-                              `/api/chapters/${ch.id}/script`,
-                              ch.id,
-                              `Scripting “${ch.title}”…`
-                            )
-                          }
-                        >
-                          {rowPending ? (
-                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          ) : (
-                            <FileText className="h-3.5 w-3.5" />
-                          )}
-                          {hasScript ? "Re-script" : "Script"}
-                        </Button>
-                        <Button
-                          size="sm"
-                          disabled={
-                            !hasScript || chapterBusy || rowPending || !hasCast || !keys.eleven
-                          }
-                          onClick={() =>
-                            post(
-                              `/api/chapters/${ch.id}/generate`,
-                              ch.id,
-                              `Generating “${ch.title}”…`
-                            )
-                          }
-                        >
-                          <Play className="h-3.5 w-3.5" />
-                          {ch.status === "ready" || ch.status === "stale"
-                            ? "Regenerate"
-                            : "Generate"}
-                        </Button>
+                        {!readOnly && (
+                          <>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={chapterBusy || rowPending || !keys.anthropic}
+                              onClick={() =>
+                                post(
+                                  `/api/chapters/${ch.id}/script`,
+                                  ch.id,
+                                  `Scripting “${ch.title}”…`
+                                )
+                              }
+                            >
+                              {rowPending ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <FileText className="h-3.5 w-3.5" />
+                              )}
+                              {hasScript ? "Re-script" : "Script"}
+                            </Button>
+                            <Button
+                              size="sm"
+                              disabled={
+                                !hasScript || chapterBusy || rowPending || !hasCast || !keys.eleven
+                              }
+                              onClick={() =>
+                                post(
+                                  `/api/chapters/${ch.id}/generate`,
+                                  ch.id,
+                                  `Generating “${ch.title}”…`
+                                )
+                              }
+                            >
+                              <Play className="h-3.5 w-3.5" />
+                              {ch.status === "ready" || ch.status === "stale"
+                                ? "Regenerate"
+                                : "Generate"}
+                            </Button>
+                          </>
+                        )}
                       </div>
                     </TableCell>
                   </TableRow>

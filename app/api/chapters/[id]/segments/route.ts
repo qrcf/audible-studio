@@ -1,5 +1,6 @@
 import { asc, eq } from "drizzle-orm";
 import { getDb, chapters, characters, segments } from "@/lib/db";
+import { viewerDeniedForBook } from "@/lib/auth/session";
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
@@ -10,6 +11,9 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     .where(eq(chapters.id, id))
     .limit(1);
   if (!chapter) return Response.json({ error: "Not found" }, { status: 404 });
+  if (await viewerDeniedForBook(chapter.bookId)) {
+    return Response.json({ error: "Not found" }, { status: 404 });
+  }
 
   const rows = await db
     .select({

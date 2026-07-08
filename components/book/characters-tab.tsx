@@ -35,6 +35,7 @@ import {
 } from "@/components/ui/tooltip";
 import { EditProfileDialog } from "./edit-profile-dialog";
 import { SplitAgesDialog } from "./split-ages-dialog";
+import { useReadOnly } from "./read-only";
 import type { CharacterData, JobData } from "./types";
 
 export function CharactersTab({
@@ -53,6 +54,7 @@ export function CharactersTab({
   canAnalyze: boolean;
 }) {
   const router = useRouter();
+  const readOnly = useReadOnly();
   const [editFor, setEditFor] = useState<CharacterData | null>(null);
   const [splitFor, setSplitFor] = useState<CharacterData | null>(null);
 
@@ -107,10 +109,12 @@ export function CharactersTab({
               quotes for voice previews, and profiles the narrator.
             </p>
           </div>
-          <Button onClick={onAnalyze} disabled={!canAnalyze}>
-            <Users className="h-4 w-4" />
-            {bookStatus === "error" ? "Retry analysis" : "Analyze characters"}
-          </Button>
+          {!readOnly && (
+            <Button onClick={onAnalyze} disabled={!canAnalyze}>
+              <Users className="h-4 w-4" />
+              {bookStatus === "error" ? "Retry analysis" : "Analyze characters"}
+            </Button>
+          )}
         </CardContent>
       </Card>
     );
@@ -123,6 +127,7 @@ export function CharactersTab({
         <p className="text-sm text-muted-foreground">
           {characters.filter((c) => !c.isNarrator).length} characters + narrator
         </p>
+        {!readOnly && (
         <AlertDialog>
           <AlertDialogTrigger asChild>
             <Button variant="outline" size="sm" disabled={!canAnalyze}>
@@ -146,6 +151,7 @@ export function CharactersTab({
             </AlertDialogFooter>
           </AlertDialogContent>
         </AlertDialog>
+        )}
       </div>
       <div className="rounded-lg border">
         <Table className="table-fixed">
@@ -155,7 +161,7 @@ export function CharactersTab({
               <TableHead className="w-[32%]">Profile</TableHead>
               <TableHead className="w-[104px]">Share</TableHead>
               <TableHead>Sample quote</TableHead>
-              <TableHead className="w-[112px] text-right">Actions</TableHead>
+              {!readOnly && <TableHead className="w-[112px] text-right">Actions</TableHead>}
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -261,6 +267,7 @@ export function CharactersTab({
                     <span className="text-xs text-muted-foreground">—</span>
                   )}
                 </TableCell>
+                {!readOnly && (
                 <TableCell>
                   <div className="flex items-center justify-end gap-0.5">
                     <Tooltip>
@@ -327,6 +334,7 @@ export function CharactersTab({
                     )}
                   </div>
                 </TableCell>
+                )}
               </TableRow>
             ))}
           </TableBody>

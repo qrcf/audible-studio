@@ -2,7 +2,8 @@ import { cache } from "react";
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { asc, eq } from "drizzle-orm";
-import { getDb, books, chapters, characters, voiceAssignments } from "@/lib/db";
+import { getDb, books, chapters, characters, voiceAssignments, bookShares } from "@/lib/db";
+import { readAuthContext } from "@/lib/auth/session";
 import { BookView } from "@/components/book/book-view";
 import type { BookData, ChapterMeta, CharacterData } from "@/components/book/types";
 
@@ -50,6 +51,18 @@ export default async function BookPage({ params }: { params: Promise<{ id: strin
       .where(eq(characters.bookId, id)),
   ]);
   if (!book) notFound();
+
+  // Share-link viewers are read-only and locked to their one book (the proxy
+  // enforces this too; this is the page-level backstop).
+  const ctx = await readAuthContext();
+  const readOnly = ctx?.role === "viewer";
+  if (ctx?.role === "viewer" && ctx.bookId !== id) notFound();
+
+  // The owner's Share control needs the current link (if any); viewers never
+  // see it, so skip the lookup for them.
+  const [share] = readOnly
+    ? []
+    : await db.select({ token: bookShares.token }).from(bookShares).where(eq(bookShares.bookId, id)).limit(1);
 
   const bookData: BookData = {
     id: book.id,
@@ -114,6 +127,8 @@ export default async function BookPage({ params }: { params: Promise<{ id: strin
       book={bookData}
       chapters={chapterData}
       characters={characterData}
+      readOnly={readOnly}
+      shareToken={share?.token ?? null}
       keys={{
         anthropic: Boolean(process.env.ANTHROPIC_API_KEY),
         eleven: Boolean(process.env.ELEVENLABS_API_KEY),

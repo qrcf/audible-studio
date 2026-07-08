@@ -46,3 +46,6 @@ next-env.d.ts
 # Workflow DevKit local run state
 .workflow-data/
 /.swc
+
+# Workflow DevKit generated route handlers
+app/.well-known/

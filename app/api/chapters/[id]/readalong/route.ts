@@ -1,6 +1,7 @@
 import { asc, eq } from "drizzle-orm";
 import { getDb, chapters, characters, segments } from "@/lib/db";
 import { errorResponse, AppError } from "@/lib/errors";
+import { viewerDeniedForBook } from "@/lib/auth/session";
 import { cleanChapterText, titleAnnouncement } from "@/lib/analysis/clean";
 
 /**
@@ -16,6 +17,9 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     const db = getDb();
     const [chapter] = await db.select().from(chapters).where(eq(chapters.id, id)).limit(1);
     if (!chapter) throw new AppError("Chapter not found", "not_found", 404);
+    if (await viewerDeniedForBook(chapter.bookId)) {
+      throw new AppError("Chapter not found", "not_found", 404);
+    }
     if (!chapter.audioPath) {
       throw new AppError("Generate this chapter first", "not_generated", 409);
     }

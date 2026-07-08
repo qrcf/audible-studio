@@ -9,7 +9,14 @@ import {
   type ChunkExtraction,
   type MergedCast,
 } from "@/lib/analysis/characters";
-import { completeJob, failJob, isCancelled, noteJob, setJobProgress, setJobTotal } from "@/lib/jobs";
+import {
+  completeJob,
+  failJob,
+  isCancelled,
+  setJobProgress,
+  setJobTotal,
+  withProgressPulse,
+} from "@/lib/jobs";
 import { setStageIf } from "@/lib/pipeline";
 
 export async function prepareAnalysis(
@@ -57,9 +64,15 @@ export async function mergeCast(
 ): Promise<MergeResult> {
   "use step";
   if (await isCancelled(jobId)) return { cancelled: true, merged: null };
-  await noteJob(jobId, "Merging cast list…");
   const { book, fullTextLength } = await loadAnalysisContext(bookId);
-  const merged = await mergeCastLlm(book, chunkResults, fullTextLength);
+  // One large LLM call over every chunk extraction — can run for minutes on a
+  // big book, so pulse an elapsed timer to show it's alive and keep the job
+  // heartbeat fresh for the reconciler.
+  const merged = await withProgressPulse(
+    jobId,
+    (s) => `Merging cast list from ${chunkResults.length} sections… (${s}s)`,
+    () => mergeCastLlm(book, chunkResults, fullTextLength)
+  );
   await setJobProgress(jobId, { note: `Found ${merged.characters.length} characters` });
   return { cancelled: false, merged };
 }

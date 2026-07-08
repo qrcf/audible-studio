@@ -24,6 +24,7 @@ import { titleAnnouncement } from "@/lib/analysis/clean";
 import { DELIVERY_VALUES } from "@/lib/delivery";
 import { estimateCredits, estimateSfxCredits, formatCredits } from "@/lib/format";
 import { speakerColor } from "./speaker-colors";
+import { useReadOnly } from "./read-only";
 import type { ChapterMeta, CharacterData } from "./types";
 
 interface SegmentRow {
@@ -52,6 +53,7 @@ export function ScriptSheet({
   renderModel: string;
   onClose: () => void;
 }) {
+  const readOnly = useReadOnly();
   const [loaded, setLoaded] = useState<{ chapterId: string; segments: SegmentRow[] } | null>(
     null
   );
@@ -200,7 +202,7 @@ export function ScriptSheet({
               : "Loading…"}
             {flaggedCount > 0 && ` · ${flaggedCount} flagged for review`}
           </SheetDescription>
-          {segments && segments.length > 0 && speakables.length > 0 && (
+          {!readOnly && segments && segments.length > 0 && speakables.length > 0 && (
             <div className="flex items-center gap-2">
               <span className="text-xs text-muted-foreground">Narrated by</span>
               <Select value={chapterNarrator} onValueChange={setChapterNarrator}>
@@ -241,15 +243,17 @@ export function ScriptSheet({
                       <Badge variant="outline" className="shrink-0 text-[10px]">
                         {seg.sfxDurationSec ?? DEFAULT_SFX_SECONDS}s
                       </Badge>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive"
-                        aria-label="Remove sound effect"
-                        onClick={() => removeSfx(seg)}
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </Button>
+                      {!readOnly && (
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-6 w-6 shrink-0 text-muted-foreground hover:text-destructive"
+                          aria-label="Remove sound effect"
+                          onClick={() => removeSfx(seg)}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </Button>
+                      )}
                     </div>
                   );
                 }
@@ -278,6 +282,7 @@ export function ScriptSheet({
                           <Flag className="h-2.5 w-2.5" /> review
                         </Badge>
                       )}
+                      {!readOnly && (
                       <div className="ml-auto flex items-center gap-1 pr-2">
                         {seg.kind === "dialogue" && (
                           <Select
@@ -318,6 +323,7 @@ export function ScriptSheet({
                           </SelectContent>
                         </Select>
                       </div>
+                      )}
                     </div>
                     <p className="pr-4 text-sm leading-relaxed text-foreground/90">
                       {seg.text}

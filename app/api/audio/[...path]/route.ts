@@ -1,4 +1,5 @@
 import { isAudioPathname, presignAudioUrl } from "@/lib/storage";
+import { readAuthContext } from "@/lib/auth/session";
 
 /**
  * Audio playback/download: hands the browser a short-lived presigned CDN URL
@@ -10,6 +11,17 @@ export async function GET(_req: Request, { params }: { params: Promise<{ path: s
   const { path: parts } = await params;
   const pathname = parts.join("/");
   if (!isAudioPathname(pathname)) return new Response("Bad path", { status: 400 });
+
+  // Share viewers may only reach their own book's audio. Blob paths are
+  // book-scoped (segments/<bookId>/…, chapters/<bookId>/…); previews aren't, so
+  // viewers are denied those outright.
+  const ctx = await readAuthContext();
+  if (ctx?.role === "viewer") {
+    const [prefix, bookId] = parts;
+    const scoped = (prefix === "segments" || prefix === "chapters") && bookId === ctx.bookId;
+    if (!scoped) return new Response("Forbidden", { status: 403 });
+  }
+
   const url = await presignAudioUrl(pathname);
   return new Response(null, {
     status: 302,

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { startAuthentication, startRegistration } from "@simplewebauthn/browser";
 import { Fingerprint, KeyRound, Loader2 } from "lucide-react";
 import { toast } from "sonner";
@@ -22,7 +22,6 @@ async function postJson(url: string, body?: unknown, headers?: Record<string, st
 }
 
 export function LoginForm() {
-  const router = useRouter();
   const searchParams = useSearchParams();
   const [busy, setBusy] = useState<"signin" | "register" | null>(null);
   const [showRegister, setShowRegister] = useState(false);
@@ -30,8 +29,11 @@ export function LoginForm() {
 
   function onSuccess() {
     const next = searchParams.get("next");
-    router.replace(next && next.startsWith("/") ? next : "/");
-    router.refresh();
+    const dest = next && next.startsWith("/") ? next : "/";
+    // Full-document navigation: forces a clean load where the proxy re-reads
+    // the freshly-set session cookie. A client router.replace can stall right
+    // after the WebAuthn ceremony and leave the button spinning.
+    window.location.replace(dest);
   }
 
   async function signIn() {

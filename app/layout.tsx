@@ -4,6 +4,7 @@ import Link from "next/link";
 import { AudioLines } from "lucide-react";
 import { Toaster } from "@/components/ui/sonner";
 import { CreditsBadge } from "@/components/credits-badge";
+import { readAuthContext } from "@/lib/auth/session";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -21,11 +22,14 @@ export const metadata: Metadata = {
   description: "Turn any book into a multi-voice audiobook with ElevenLabs",
 };
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  // Viewers see a book they don't own — don't expose the account's credit usage.
+  const ctx = await readAuthContext();
+  const isViewer = ctx?.role === "viewer";
   return (
     <html
       lang="en"
@@ -38,7 +42,7 @@ export default function RootLayout({
               <AudioLines className="h-5 w-5 text-primary" />
               Audiobook Studio
             </Link>
-            <CreditsBadge />
+            {!isViewer && <CreditsBadge />}
           </div>
         </header>
         <main className="mx-auto w-full max-w-6xl flex-1 px-6 py-8">{children}</main>

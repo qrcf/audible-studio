@@ -35,6 +35,7 @@ import {
 } from "@/components/ui/tooltip";
 import type { VoiceSettings } from "@/lib/db/schema";
 import { PreviewButton, fetchPreviewUrl } from "./preview-button";
+import { useReadOnly } from "./read-only";
 import type { CharacterData, VoiceData } from "./types";
 
 type CatalogState =
@@ -58,6 +59,7 @@ export function VoicesTab({
   busy: boolean;
 }) {
   const router = useRouter();
+  const readOnly = useReadOnly();
   const [gender, setGender] = useState("any");
   const [accent, setAccent] = useState("any");
   const [search, setSearch] = useState("");
@@ -190,6 +192,7 @@ export function VoicesTab({
   return (
     <TooltipProvider>
     <div className="space-y-4">
+      {!readOnly && (
       <div className="flex flex-wrap items-center gap-2">
         <Input
           placeholder="Filter voices…"
@@ -231,6 +234,7 @@ export function VoicesTab({
           </Button>
         </div>
       </div>
+      )}
 
       <div className="rounded-lg border">
         <Table className="table-fixed">
@@ -306,6 +310,11 @@ export function VoicesTab({
                     </Tooltip>
                   </TableCell>
                   <TableCell className="overflow-hidden">
+                    {readOnly ? (
+                      <span className="block min-w-0 truncate text-sm">
+                        {assignedVoice?.name ?? assigned?.voiceName ?? "—"}
+                      </span>
+                    ) : (
                     <div className="flex min-w-0 items-center gap-1.5">
                       <Select
                         value={assigned?.voiceId ?? ""}
@@ -345,6 +354,7 @@ export function VoicesTab({
                         />
                       )}
                     </div>
+                    )}
                   </TableCell>
                   <TableCell className="overflow-hidden">
                     {assigned ? (
@@ -373,7 +383,7 @@ export function VoicesTab({
                           getUrl={async () => assignedVoice.previewUrl!}
                         />
                       )}
-                      {assigned && quote && (
+                      {!readOnly && assigned && quote && (
                         <PreviewButton
                           variant="outline"
                           label={`Hear ${c.isNarrator ? "the opening" : "a real quote"} in this voice`}
@@ -394,11 +404,13 @@ export function VoicesTab({
           </TableBody>
         </Table>
       </div>
-      <p className="text-xs text-muted-foreground">
-        The outlined play button renders the character&apos;s actual line from the book with
-        the selected voice (uses a few credits, cached). Changing a voice marks already
-        generated chapters stale — regenerating only re-renders that character&apos;s lines.
-      </p>
+      {!readOnly && (
+        <p className="text-xs text-muted-foreground">
+          The outlined play button renders the character&apos;s actual line from the book with
+          the selected voice (uses a few credits, cached). Changing a voice marks already
+          generated chapters stale — regenerating only re-renders that character&apos;s lines.
+        </p>
+      )}
     </div>
     </TooltipProvider>
   );

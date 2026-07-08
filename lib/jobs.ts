@@ -52,6 +52,33 @@ export async function noteJob(id: string, note: string): Promise<void> {
   await getDb().update(jobs).set({ note, updatedAt: new Date() }).where(eq(jobs.id, id));
 }
 
+/**
+ * Run `fn` while pulsing an elapsed-time note every few seconds. For single
+ * long LLM calls (e.g. the cast merge) this keeps the UI visibly alive and
+ * keeps updatedAt fresh so the stale-job reconciler never mistakes a slow
+ * step for a dead one. `label(elapsedSec)` builds the note text.
+ */
+export async function withProgressPulse<T>(
+  jobId: string,
+  label: (elapsedSec: number) => string,
+  fn: () => Promise<T>,
+  intervalMs = 5000
+): Promise<T> {
+  const startedAt = Date.now();
+  await noteJob(jobId, label(0));
+  const timer = setInterval(() => {
+    const elapsed = Math.round((Date.now() - startedAt) / 1000);
+    noteJob(jobId, label(elapsed)).catch(() => {
+      // a dropped pulse is harmless; the next one retries
+    });
+  }, intervalMs);
+  try {
+    return await fn();
+  } finally {
+    clearInterval(timer);
+  }
+}
+
 // Terminal transitions only apply to running jobs so a cancellation that
 // lands first isn't overwritten by the worker's own complete/fail.
 export async function completeJob(id: string): Promise<void> {

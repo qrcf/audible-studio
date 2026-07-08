@@ -206,6 +206,21 @@ export const voiceCatalogSnapshots = pgTable("voice_catalog_snapshots", {
   fetchedAt: timestamp("fetched_at", { withTimezone: true, mode: "date" }).notNull(),
 });
 
+// Read-only share links: one revocable link per book. The `token` is the
+// unguessable URL secret; redeeming it mints a viewer session scoped to bookId.
+export const bookShares = pgTable("book_shares", {
+  id: text("id").primaryKey(),
+  bookId: text("book_id")
+    .notNull()
+    .unique()
+    .references(() => books.id, { onDelete: "cascade" }),
+  token: text("token").notNull().unique(),
+  createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
+    .notNull()
+    .defaultNow(),
+  lastViewedAt: timestamp("last_viewed_at", { withTimezone: true, mode: "date" }),
+});
+
 // WebAuthn passkeys for the single app user
 export const credentials = pgTable("credentials", {
   // base64url credential ID from the authenticator

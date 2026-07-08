@@ -29,6 +29,7 @@ import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { formatDuration } from "@/lib/format";
 import { speakerColor } from "./speaker-colors";
+import { useReadOnly } from "./read-only";
 import type { BookData, ChapterMeta } from "./types";
 
 function saveBlob(blob: Blob, filename: string) {
@@ -91,6 +92,7 @@ interface ReadalongScript {
 }
 
 export function ListenTab({ book, chapters }: { book: BookData; chapters: ChapterMeta[] }) {
+  const readOnly = useReadOnly();
   const playable = chapters.filter(
     (c) => c.audioPath && (c.status === "ready" || c.status === "stale")
   );
@@ -516,6 +518,7 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
         <p className="text-sm text-muted-foreground">
           {playable.length} of {chapters.length} chapters generated
         </p>
+        {!readOnly && (
         <Button
           variant="outline"
           disabled={zipping || playable.length === 0}
@@ -548,6 +551,7 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
           {zipping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
           Download all (.zip)
         </Button>
+        )}
       </div>
 
       <div className="divide-y rounded-lg border">
@@ -587,18 +591,20 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
             <span className="font-mono text-xs text-muted-foreground">
               {ch.durationSec ? formatDuration(ch.durationSec) : ""}
             </span>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8"
-              onClick={() =>
-                saveAudio(ch.audioPath!, `${ch.idx + 1} - ${ch.title}.mp3`).catch(() =>
-                  toast.error("Download failed")
-                )
-              }
-            >
-              <Download className="h-4 w-4" />
-            </Button>
+            {!readOnly && (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8"
+                onClick={() =>
+                  saveAudio(ch.audioPath!, `${ch.idx + 1} - ${ch.title}.mp3`).catch(() =>
+                    toast.error("Download failed")
+                  )
+                }
+              >
+                <Download className="h-4 w-4" />
+              </Button>
+            )}
           </div>
         ))}
       </div>

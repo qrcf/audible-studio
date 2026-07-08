@@ -10,6 +10,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { StatusBadge } from "@/components/status-badge";
 import { estimateCredits, formatCredits } from "@/lib/format";
 import { ModelPrefsPopover } from "./model-prefs-popover";
+import { ShareDialog } from "./share-dialog";
+import { ReadOnlyProvider } from "./read-only";
 import { PipelineCard } from "./pipeline-card";
 import { CharactersTab } from "./characters-tab";
 import { VoicesTab } from "./voices-tab";
@@ -30,11 +32,15 @@ export function BookView({
   chapters,
   characters,
   keys,
+  readOnly = false,
+  shareToken = null,
 }: {
   book: BookData;
   chapters: ChapterMeta[];
   characters: CharacterData[];
   keys: ApiKeysPresent;
+  readOnly?: boolean;
+  shareToken?: string | null;
 }) {
   const router = useRouter();
   const [progress, setProgress] = useState<ProgressData | null>(null);
@@ -67,6 +73,8 @@ export function BookView({
     casting;
 
   useEffect(() => {
+    // Nothing changes for a read-only viewer — skip the polling/refresh loop.
+    if (readOnly) return;
     let cancelled = false;
     const tick = async () => {
       try {
@@ -95,7 +103,7 @@ export function BookView({
       cancelled = true;
       clearInterval(interval);
     };
-  }, [book.id, router]);
+  }, [book.id, router, readOnly]);
 
   const totalChars = chapters.reduce((sum, c) => sum + c.charCount, 0);
 
@@ -213,6 +221,7 @@ export function BookView({
   const bookError = progress?.book.error ?? book.error;
 
   return (
+    <ReadOnlyProvider value={readOnly}>
     <div className="space-y-6">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
@@ -227,22 +236,27 @@ export function BookView({
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <ModelPrefsPopover book={book} />
-          {!livePipelineStage && hasCharacters && (
-            <Button variant="outline" onClick={startPipeline} disabled={busy || starting}>
-              {starting ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Wand2 className="h-4 w-4" />
+          {!readOnly && (
+            <>
+              <ShareDialog bookId={book.id} initialToken={shareToken} />
+              <ModelPrefsPopover book={book} />
+              {!livePipelineStage && hasCharacters && (
+                <Button variant="outline" onClick={startPipeline} disabled={busy || starting}>
+                  {starting ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Wand2 className="h-4 w-4" />
+                  )}
+                  Guided setup
+                </Button>
               )}
-              Guided setup
-            </Button>
+              {primaryAction}
+            </>
           )}
-          {primaryAction}
         </div>
       </div>
 
-      {livePipelineStage && (
+      {!readOnly && livePipelineStage && (
         <PipelineCard
           bookId={book.id}
           stage={livePipelineStage}
@@ -306,5 +320,6 @@ export function BookView({
         </TabsContent>
       </Tabs>
     </div>
+    </ReadOnlyProvider>
   );
 }
