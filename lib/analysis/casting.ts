@@ -13,8 +13,9 @@ export const CAST_BATCH = 8;
 const castingSchema = z.object({
   assignments: z.array(
     z.object({
-      characterId: z.string(),
-      voiceId: z.string(),
+      characterRef: z.number().int().describe("The character's number from CHARACTERS TO CAST NOW"),
+      voiceRef: z.number().int().describe("The chosen voice's number from AVAILABLE VOICES"),
+      voiceName: z.string().describe("Name of the chosen voice — must match the voice at voiceRef"),
       rationale: z.string().describe("One line: why this voice fits this character"),
       stability: z
         .number()
@@ -25,6 +26,8 @@ const castingSchema = z.object({
     })
   ),
 });
+
+const normalizeName = (name: string) => name.trim().toLowerCase();
 
 export interface AlreadyCastEntry {
   name: string;
@@ -124,9 +127,16 @@ export async function castBatchLlm(
   const batch = batchIds.map((id) => byId.get(id)).filter((c) => c !== undefined);
 
   const voices = await getVoiceCatalog();
-  const voiceById = new Map(voices.map((v) => [v.id, v]));
-  const voiceInput = voices.map((v) => ({
-    voiceId: v.id,
+  // The model returns 1-based refs (indexes) instead of opaque ElevenLabs ids —
+  // LLMs copy small integers reliably but mangle random 20-char id strings.
+  // voiceName is a semantic cross-check so a wrong ref self-corrects by name.
+  const voicesByNormName = new Map<string, VoiceProfile>();
+  for (const v of voices) {
+    const key = normalizeName(v.name);
+    if (!voicesByNormName.has(key)) voicesByNormName.set(key, v);
+  }
+  const voiceInput = voices.map((v, i) => ({
+    ref: i + 1,
     name: v.name,
     gender: v.gender,
     age: v.age,
@@ -136,8 +146,8 @@ export async function castBatchLlm(
     description: v.description?.slice(0, 180),
   }));
 
-  const batchInput = batch.map((c) => ({
-    characterId: c.id,
+  const batchInput = batch.map((c, i) => ({
+    ref: i + 1,
     name: c.name,
     isNarrator: c.isNarrator,
     role: c.role,
@@ -152,7 +162,7 @@ export async function castBatchLlm(
     prompt:
       `Cast ElevenLabs voices for an audiobook of "${book.title}".\n\n` +
       `Rules:\n` +
-      `- Assign exactly one voice to every characterId listed, each appearing exactly once, with a SPECIFIC one-line rationale tied to the character — never filler like "placeholder".\n` +
+      `- Assign exactly one voice to every character listed (identify it by its characterRef number), each appearing exactly once. For each, return the chosen voice's voiceRef number AND its matching voiceName, plus a SPECIFIC one-line rationale tied to the character — never filler like "placeholder".\n` +
       `- Match gender strictly when known, and match age closely (an elderly character must not get a young voice and vice versa); approximate accent.\n` +
       `- The narrator entry (isNarrator=true) gets the best narration-suited voice (useCase like "narrative_story", calm/neutral) and stability around 0.65.\n` +
       `- The narrator and all "major" characters must each get a DISTINCT voice not in ALREADY CAST. "minor" characters may reuse each other's voices (never a major character's or the narrator's) when there aren't enough matching voices.\n` +
@@ -160,23 +170,30 @@ export async function castBatchLlm(
       (hasVariants
         ? `- Characters sharing a variantGroup are ONE person at different life stages: give each a DIFFERENT voice, but keep gender and accent consistent and pick voices that plausibly sound like the same person younger/older.\n`
         : "") +
-      `\nCHARACTERS TO CAST NOW:\n${JSON.stringify(batchInput)}\n\n` +
+      `\nCHARACTERS TO CAST NOW (each has a ref number):\n${JSON.stringify(batchInput)}\n\n` +
       (alreadyCast.length > 0
         ? `ALREADY CAST (fixed — do not reassign these voices to narrator/major characters; keep new picks consistent, especially same-variantGroup siblings):\n${JSON.stringify(alreadyCast)}\n\n`
         : "") +
-      `AVAILABLE VOICES:\n${JSON.stringify(voiceInput)}`,
+      `AVAILABLE VOICES (each has a ref number):\n${JSON.stringify(voiceInput)}`,
   });
 
   const nextAlreadyCast = [...alreadyCast];
   const taken = new Set(takenVoiceIds);
   const rows: AssignmentRow[] = [];
-  for (const character of batch) {
-    const pick = object.assignments.find((a) => a.characterId === character.id);
-    const voice = pick ? voiceById.get(pick.voiceId) : undefined;
+  for (let i = 0; i < batch.length; i++) {
+    const character = batch[i];
+    const pick = object.assignments.find((a) => a.characterRef === i + 1);
+    let voice = pick && Number.isInteger(pick.voiceRef) ? voices[pick.voiceRef - 1] : undefined;
+    // Self-correct: if the ref is out of range or its name disagrees with the
+    // model's stated voiceName, trust the name (that's the model's real intent).
+    if (pick && (!voice || normalizeName(voice.name) !== normalizeName(pick.voiceName))) {
+      const byName = voicesByNormName.get(normalizeName(pick.voiceName));
+      if (byName) voice = byName;
+    }
     const problem = !pick
       ? "missing from response"
       : !voice
-        ? "unknown voiceId"
+        ? "unknown voice"
         : validatePick(character, voice, pick.rationale);
     let chosen: { voice: VoiceProfile; rationale: string; stability?: number; speed?: number };
     if (pick && voice && !problem) {
