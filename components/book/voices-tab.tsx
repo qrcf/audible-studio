@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Loader2, RefreshCw, Settings2 } from "lucide-react";
 import { toast } from "sonner";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -91,6 +91,35 @@ export function VoicesTab({
   const catalog: CatalogState =
     loaded && loaded.key === reloadKey ? loaded.state : { status: "loading" };
   const voices = catalog.status === "ready" ? catalog.voices : NO_VOICES;
+
+  // Cast picks can come from the full live library, outside the cached browse
+  // list — so fold every character's assigned voice into the picker list (cast
+  // voices first) and always show them, with catalog metadata when available.
+  const allVoices = useMemo<VoiceData[]>(() => {
+    const byId = new Map(voices.map((v) => [v.id, v] as const));
+    const castFirst: VoiceData[] = [];
+    const seen = new Set<string>();
+    for (const c of characters) {
+      const a = c.assignment;
+      if (!a || seen.has(a.voiceId)) continue;
+      seen.add(a.voiceId);
+      castFirst.push(
+        byId.get(a.voiceId) ?? {
+          id: a.voiceId,
+          name: a.voiceName,
+          category: "cast",
+          description: null,
+          gender: null,
+          age: null,
+          accent: null,
+          descriptive: null,
+          useCase: null,
+          previewUrl: null,
+        }
+      );
+    }
+    return [...castFirst, ...voices.filter((v) => !seen.has(v.id))];
+  }, [voices, characters]);
 
   if (!elevenReady) {
     return (
@@ -191,7 +220,7 @@ export function VoicesTab({
           <TableBody>
             {characters.map((c) => {
               const assigned = c.assignment;
-              const assignedVoice = voices.find((v) => v.id === assigned?.voiceId);
+              const assignedVoice = allVoices.find((v) => v.id === assigned?.voiceId);
               const quote = c.quotes[0];
 
               return (
@@ -239,11 +268,11 @@ export function VoicesTab({
                     ) : (
                     <div className="flex min-w-0 items-center gap-1.5">
                       <VoiceCombobox
-                        voices={voices}
+                        voices={allVoices}
                         value={assigned?.voiceId}
                         selectedLabel={assigned?.voiceName}
                         onChange={(v) => changeVoice(c.id, v)}
-                        disabled={voices.length === 0}
+                        disabled={allVoices.length === 0}
                         loading={saving === c.id}
                       />
                       {assigned && (

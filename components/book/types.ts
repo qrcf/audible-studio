@@ -57,13 +57,15 @@ export type VoiceData = VoiceProfile;
 
 export interface JobData {
   id: string;
-  type: "analyze" | "cast" | "script" | "generate";
+  type: "analyze" | "cast" | "script" | "generate" | "intro";
   chapterId: string | null;
   status: "running" | "completed" | "failed" | "cancelled";
   done: number;
   total: number;
   note: string | null;
   error: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface ProgressData {

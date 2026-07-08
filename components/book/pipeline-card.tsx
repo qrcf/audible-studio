@@ -63,6 +63,7 @@ export function PipelineCard({
   bookStatus,
   bookError,
   jobs,
+  jobsLoaded,
   chapters,
   characters,
   keys,
@@ -74,6 +75,7 @@ export function PipelineCard({
   bookStatus: string;
   bookError: string | null;
   jobs: JobData[];
+  jobsLoaded: boolean;
   chapters: ChapterMeta[];
   characters: CharacterData[];
   keys: ApiKeysPresent;
@@ -99,8 +101,11 @@ export function PipelineCard({
   const sampleFailed =
     ["scripting_sample", "generating_sample"].includes(stage) && sample?.status === "error";
   // A running-type stage with no live job means the worker died (e.g. the dev
-  // server restarted mid-run) — surface Retry instead of spinning forever.
-  const orphaned = RUNNING_STAGES.includes(stage) && !job && !bookFailed && !sampleFailed;
+  // server restarted mid-run) — surface Retry instead of spinning forever. But
+  // only once the first poll has actually loaded jobs: on a hard refresh jobs
+  // are momentarily empty, and treating that as orphaned flashes a false Retry.
+  const orphaned =
+    jobsLoaded && RUNNING_STAGES.includes(stage) && !job && !bookFailed && !sampleFailed;
   const failed = bookFailed || sampleFailed || orphaned;
   const failureMessage =
     (bookFailed ? bookError : sampleFailed ? sample?.error : null) ??

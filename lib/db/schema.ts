@@ -186,7 +186,7 @@ export const jobs = pgTable(
   "jobs",
   {
     id: text("id").primaryKey(),
-    type: text("type").$type<"analyze" | "cast" | "script" | "generate">().notNull(),
+    type: text("type").$type<"analyze" | "cast" | "script" | "generate" | "intro">().notNull(),
     bookId: text("book_id")
       .notNull()
       .references(() => books.id, { onDelete: "cascade" }),

@@ -14,6 +14,7 @@ import { EditBookDialog } from "./edit-book-dialog";
 import { ShareDialog } from "./share-dialog";
 import { ReadOnlyProvider } from "./read-only";
 import { PipelineCard } from "./pipeline-card";
+import { ProgressStrip } from "./progress-strip";
 import { CharactersTab } from "./characters-tab";
 import { VoicesTab } from "./voices-tab";
 import { ChaptersTab } from "./chapters-tab";
@@ -66,6 +67,11 @@ export function BookView({
     () => progress?.jobs.filter((j) => j.status === "running") ?? [],
     [progress]
   );
+  const jobsLoaded = progress !== null;
+  const introJob = useMemo(
+    () => runningJobs.find((j) => j.type === "intro") ?? null,
+    [runningJobs]
+  );
   const busy =
     ["analyzing", "casting", "generating"].includes(liveBookStatus) ||
     liveChapters.some((c) => ["scripting", "generating"].includes(c.status)) ||
@@ -83,13 +89,18 @@ export function BookView({
         if (!res.ok || cancelled) return;
         const data: ProgressData = await res.json();
         setProgress(data);
-        // When statuses change (a step finished), re-pull server data
+        // When statuses change (a step finished), re-pull server data. Include
+        // job status transitions (id+status, not progress) so completions that
+        // don't move book/chapter status — e.g. the intro job writing
+        // introAudioPath — still trigger a refresh.
         const snapshot =
           data.book.status +
           "|" +
           (data.book.pipelineStage ?? "") +
           "|" +
-          data.chapters.map((c) => c.status).join(",");
+          data.chapters.map((c) => c.status).join(",") +
+          "|" +
+          data.jobs.map((j) => j.id + j.status).join(",");
         if (snapshotRef.current && snapshotRef.current !== snapshot) {
           router.refresh();
         }
@@ -266,12 +277,17 @@ export function BookView({
           bookStatus={liveBookStatus}
           bookError={bookError}
           jobs={progress?.jobs ?? []}
+          jobsLoaded={jobsLoaded}
           chapters={liveChapters}
           characters={characters}
           keys={keys}
           onNavigate={setTab}
           onCancel={cancelAll}
         />
+      )}
+
+      {!readOnly && !livePipelineStage && runningJobs.length > 0 && (
+        <ProgressStrip jobs={runningJobs} chapters={liveChapters} />
       )}
 
       {bookError && liveBookStatus === "error" && !livePipelineStage && (
@@ -319,7 +335,7 @@ export function BookView({
           />
         </TabsContent>
         <TabsContent value="listen" className="mt-4">
-          <ListenTab book={book} chapters={liveChapters} />
+          <ListenTab book={book} chapters={liveChapters} introJob={introJob} />
         </TabsContent>
       </Tabs>
     </div>

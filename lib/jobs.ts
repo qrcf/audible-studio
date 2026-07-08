@@ -6,7 +6,7 @@ import type { JobStatus } from "@/lib/db/schema";
 import { JobCancelledError } from "@/lib/errors";
 
 export async function createJob(
-  type: "analyze" | "cast" | "script" | "generate",
+  type: "analyze" | "cast" | "script" | "generate" | "intro",
   bookId: string,
   chapterId?: string
 ): Promise<string> {

@@ -20,6 +20,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
 import {
   Select,
   SelectContent,
@@ -33,7 +34,7 @@ import { cn } from "@/lib/utils";
 import { formatDuration } from "@/lib/format";
 import { speakerColor } from "./speaker-colors";
 import { useReadOnly } from "./read-only";
-import type { BookData, ChapterMeta } from "./types";
+import type { BookData, ChapterMeta, JobData } from "./types";
 
 function saveBlob(blob: Blob, filename: string) {
   const a = document.createElement("a");
@@ -96,29 +97,50 @@ interface ReadalongScript {
 
 const INTRO_ID = "__intro__";
 
-export function ListenTab({ book, chapters }: { book: BookData; chapters: ChapterMeta[] }) {
+export function ListenTab({
+  book,
+  chapters,
+  introJob,
+}: {
+  book: BookData;
+  chapters: ChapterMeta[];
+  introJob: JobData | null;
+}) {
   const readOnly = useReadOnly();
   const router = useRouter();
-  const [regenIntro, setRegenIntro] = useState(false);
+  const [startingIntro, setStartingIntro] = useState(false);
   const readyChapters = useMemo(
     () => chapters.filter((c) => c.audioPath && (c.status === "ready" || c.status === "stale")),
     [chapters]
   );
-  // The book intro plays as its own leading section and streams into chapter 1.
-  const playable = useMemo<ChapterMeta[]>(() => {
-    if (!book.introAudioPath) return readyChapters;
-    const intro: ChapterMeta = {
+  const introReady = Boolean(book.introAudioPath);
+  const introBusy = Boolean(introJob) || startingIntro;
+  // The intro is its own leading section. Its row is ALWAYS shown (so a book
+  // without one can generate it), but it only joins the playback list once its
+  // audio exists.
+  const introItem = useMemo<ChapterMeta>(
+    () => ({
       id: INTRO_ID,
       idx: -1,
       title: "Intro",
       charCount: 0,
-      status: "ready",
+      status: introReady ? "ready" : "pending",
       durationSec: book.introDurationSec,
       audioPath: book.introAudioPath,
       error: null,
-    };
-    return [intro, ...readyChapters];
-  }, [readyChapters, book.introAudioPath, book.introDurationSec]);
+    }),
+    [introReady, book.introAudioPath, book.introDurationSec]
+  );
+  const playable = useMemo<ChapterMeta[]>(
+    () => (introReady ? [introItem, ...readyChapters] : readyChapters),
+    [introReady, introItem, readyChapters]
+  );
+  // What the list renders: the intro row leads (always for the owner so they can
+  // generate it; for read-only viewers only once it exists), then ready chapters.
+  const displayList = useMemo<ChapterMeta[]>(
+    () => (introReady || !readOnly ? [introItem, ...readyChapters] : readyChapters),
+    [introReady, readOnly, introItem, readyChapters]
+  );
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [current, setCurrent] = useState<ChapterMeta | null>(null);
   const [playing, setPlaying] = useState(false);
@@ -336,7 +358,7 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
     if (!playing) audio.play();
   };
 
-  if (playable.length === 0) {
+  if (readyChapters.length === 0 && !introReady && !introBusy) {
     return (
       <Card>
         <CardContent className="flex flex-col items-center gap-3 py-16 text-center">
@@ -357,18 +379,20 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
     if (audio) audio.currentTime = Math.max(0, Math.min(audio.duration || 0, audio.currentTime + delta));
   };
 
-  async function regenerateIntro() {
-    setRegenIntro(true);
+  // Kick off intro generation as a tracked job; the poll picks up the running
+  // job within ~2s and drives the progress UI (which survives a refresh).
+  async function generateIntro() {
+    setStartingIntro(true);
     try {
       const res = await fetch(`/api/books/${book.id}/intro`, { method: "POST" });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
-      toast.success("Intro regenerated — title, author & music");
+      toast.info(introReady ? "Regenerating intro…" : "Generating intro — title, author & music…");
       router.refresh();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to regenerate intro");
+      toast.error(err instanceof Error ? err.message : "Failed to generate intro");
     } finally {
-      setRegenIntro(false);
+      setStartingIntro(false);
     }
   }
 
@@ -594,8 +618,48 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
       </div>
 
       <div className="divide-y rounded-lg border">
-        {playable.map((ch) => {
+        {displayList.map((ch) => {
           const isIntro = ch.id === INTRO_ID;
+
+          // Intro row before it has audio (missing) or while (re)generating — no
+          // play/download yet; it offers Generate or shows live progress.
+          if (isIntro && (!introReady || introBusy)) {
+            const pct =
+              introJob && introJob.total > 0 ? (introJob.done / introJob.total) * 100 : undefined;
+            return (
+              <div key={ch.id} className="flex items-center gap-3 px-4 py-2.5">
+                <div className="flex h-8 w-8 shrink-0 items-center justify-center text-muted-foreground">
+                  {introBusy ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Music className="h-4 w-4" />
+                  )}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-medium">Intro</p>
+                  {introBusy ? (
+                    <div className="mt-1 space-y-1">
+                      <Progress value={pct} className="h-1" />
+                      <p className="truncate text-xs text-muted-foreground">
+                        {introJob?.note ?? "Starting…"}
+                      </p>
+                    </div>
+                  ) : (
+                    <p className="truncate text-xs text-muted-foreground">
+                      {book.title}
+                      {book.author ? `, by ${book.author}` : ""} · title &amp; a themed music bed
+                    </p>
+                  )}
+                </div>
+                {!readOnly && !introBusy && (
+                  <Button variant="outline" size="sm" onClick={generateIntro}>
+                    <Music className="h-3.5 w-3.5" /> Generate intro
+                  </Button>
+                )}
+              </div>
+            );
+          }
+
           return (
           <div
             key={ch.id}
@@ -650,14 +714,10 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
                 size="icon"
                 className="h-8 w-8"
                 title="Regenerate title & music"
-                disabled={regenIntro}
-                onClick={regenerateIntro}
+                disabled={startingIntro}
+                onClick={generateIntro}
               >
-                {regenIntro ? (
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                ) : (
-                  <RefreshCw className="h-4 w-4" />
-                )}
+                <RefreshCw className="h-4 w-4" />
               </Button>
             )}
             {!readOnly && (

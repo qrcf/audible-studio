@@ -37,7 +37,8 @@ export async function castWorkflow(bookId: string, jobId: string): Promise<void>
         alreadyCast,
         takenVoiceIds,
         prep.hasVariants,
-        note
+        note,
+        offset
       );
       if (out.cancelled) {
         await unwindCastCancelled(bookId);

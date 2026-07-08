@@ -8,7 +8,15 @@ import {
   type AssignmentRow,
   type CastingPrep,
 } from "@/lib/analysis/casting";
-import { completeJob, failJob, isCancelled, noteJob } from "@/lib/jobs";
+import {
+  completeJob,
+  failJob,
+  isCancelled,
+  noteJob,
+  setJobProgress,
+  setJobTotal,
+  withProgressPulse,
+} from "@/lib/jobs";
 import { setStageIf } from "@/lib/pipeline";
 
 export type { AlreadyCastEntry, AssignmentRow };
@@ -21,6 +29,8 @@ export async function prepareCast(
   if (await isCancelled(jobId)) return { cancelled: true, prep: null };
   await noteJob(jobId, "Loading voice catalog…");
   const prep = await prepareCasting(bookId);
+  // The bar fills one character at a time; batches advance `done` by their size.
+  await setJobTotal(jobId, prep.orderedIds.length);
   if (prep.characterCount > 0) {
     await noteJob(
       jobId,
@@ -44,14 +54,22 @@ export async function castBatch(
   alreadyCast: AlreadyCastEntry[],
   takenVoiceIds: string[],
   hasVariants: boolean,
-  progressNote: string
+  progressNote: string,
+  done: number
 ): Promise<CastBatchStepResult> {
   "use step";
   if (await isCancelled(jobId)) {
     return { cancelled: true, rows: [], alreadyCast, takenVoiceIds };
   }
-  await noteJob(jobId, progressNote);
-  const out = await castBatchLlm(bookId, batchIds, alreadyCast, takenVoiceIds, hasVariants);
+  // Advance the bar to the start of this batch, then pulse an elapsed-time note
+  // so a long agentic batch stays visibly alive and updatedAt keeps the stale
+  // reaper away.
+  await setJobProgress(jobId, { done, note: progressNote });
+  const out = await withProgressPulse(
+    jobId,
+    (s) => `${progressNote} (${s}s)`,
+    () => castBatchLlm(bookId, batchIds, alreadyCast, takenVoiceIds, hasVariants)
+  );
   return { cancelled: false, ...out };
 }
 
@@ -64,7 +82,8 @@ export async function saveAssignments(
 ): Promise<{ cancelled: boolean }> {
   "use step";
   if (await isCancelled(jobId)) return { cancelled: true };
-  await noteJob(jobId, "Saving assignments…");
+  // All batches done — fill the bar while the final save runs.
+  await setJobProgress(jobId, { done: toCastIds.length, note: "Saving assignments…" });
   await persistAssignments(bookId, toCastIds, rows, shouldAdvanceStatus);
   return { cancelled: false };
 }

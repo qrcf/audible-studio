@@ -27,11 +27,14 @@ export function VoiceCombobox({
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
+  const [results, setResults] = useState<VoiceData[]>([]);
+  const [searching, setSearching] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
   const selected = voices.find((v) => v.id === value);
 
-  const filtered = useMemo(() => {
+  // Instant local matches over the cached list (browse set).
+  const localFiltered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return voices;
     return voices.filter((v) =>
@@ -40,6 +43,41 @@ export function VoiceCombobox({
       )
     );
   }, [voices, query]);
+
+  // Debounced LIVE search over the full English library (thousands of voices)
+  // so any voice is reachable, not just the cached slice.
+  useEffect(() => {
+    const q = query.trim();
+    const t = setTimeout(
+      async () => {
+        if (q.length < 2) {
+          setResults([]);
+          setSearching(false);
+          return;
+        }
+        setSearching(true);
+        try {
+          const res = await fetch(`/api/voices/search?q=${encodeURIComponent(q)}`);
+          const data = await res.json();
+          setResults(Array.isArray(data) ? (data as VoiceData[]) : []);
+        } catch {
+          setResults([]);
+        } finally {
+          setSearching(false);
+        }
+      },
+      q.length < 2 ? 0 : 250
+    );
+    return () => clearTimeout(t);
+  }, [query]);
+
+  // While typing: instant local matches, augmented by live results (deduped).
+  const filtered = useMemo(() => {
+    if (!query.trim()) return voices;
+    const byId = new Map<string, VoiceData>();
+    for (const v of [...localFiltered, ...results]) if (!byId.has(v.id)) byId.set(v.id, v);
+    return [...byId.values()];
+  }, [query, voices, localFiltered, results]);
 
   // Keep the active row on screen as the arrow keys move it.
   useEffect(() => {
@@ -107,13 +145,16 @@ export function VoiceCombobox({
               setActive(0);
             }}
             onKeyDown={onKeyDown}
-            placeholder="Search voices…"
+            placeholder="Search all English voices…"
             className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
           />
+          {searching && <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin opacity-50" />}
         </div>
         <div ref={listRef} className="max-h-64 overflow-y-auto p-1">
           {filtered.length === 0 ? (
-            <p className="px-2 py-6 text-center text-sm text-muted-foreground">No voices found</p>
+            <p className="px-2 py-6 text-center text-sm text-muted-foreground">
+              {searching ? "Searching…" : "No voices found"}
+            </p>
           ) : (
             filtered.map((v, i) => (
               <button
