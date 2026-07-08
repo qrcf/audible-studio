@@ -8,6 +8,7 @@ import {
   isV3,
   snapStabilityV3,
 } from "@/lib/delivery";
+import { estimateSfxCredits } from "@/lib/format";
 
 export interface Assignment {
   voiceId: string;
@@ -17,6 +18,22 @@ export interface Assignment {
 
 export const CONTEXT_CHARS = 250; // previous_text / next_text conditioning window
 export const DEFAULT_SFX_SECONDS = 3;
+
+/**
+ * Rough per-segment work size for the progress bar / ETA. TTS time scales with
+ * characters synthesized, so speech weighs its text length; SFX (fixed-duration
+ * generation) weighs its credit estimate — matching how charsUsed accounts for
+ * it. Cache-independent by design: a cached segment still counts its full size.
+ */
+export function segmentGenWeight(seg: {
+  kind: "narration" | "dialogue" | "sfx";
+  text: string;
+  sfxDurationSec: number | null;
+}): number {
+  return seg.kind === "sfx"
+    ? estimateSfxCredits(seg.sfxDurationSec ?? DEFAULT_SFX_SECONDS)
+    : seg.text.length;
+}
 
 /**
  * What actually gets sent to TTS for a speech segment: v3 renders delivery as

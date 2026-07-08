@@ -9,6 +9,7 @@ import {
   getAssignmentResolver,
   refreshBookStatus,
   renderPlan,
+  segmentGenWeight,
 } from "@/lib/generation";
 import { ttsConvert, splitForModel } from "@/lib/elevenlabs/tts";
 import { soundEffect } from "@/lib/elevenlabs/sfx";
@@ -72,7 +73,13 @@ export async function prepareChapter(
   const [chapter] = await db.select().from(chapters).where(eq(chapters.id, chapterId)).limit(1);
   if (!chapter) throw new FatalError("Chapter not found");
   const segs = await db
-    .select({ id: segments.id, characterId: segments.characterId, kind: segments.kind })
+    .select({
+      id: segments.id,
+      characterId: segments.characterId,
+      kind: segments.kind,
+      text: segments.text,
+      sfxDurationSec: segments.sfxDurationSec,
+    })
     .from(segments)
     .where(eq(segments.chapterId, chapterId))
     .orderBy(asc(segments.idx));
@@ -84,7 +91,11 @@ export async function prepareChapter(
     throw new FatalError(`No voice assigned for: ${missing.join(", ")}. Cast voices first.`);
   }
 
-  await setJobTotal(jobId, segs.length);
+  // The job's total is character weight (render time ∝ text), so the progress
+  // bar and ETA track how much *text* is left. The returned `total` stays the
+  // segment count, which the batch loop uses as its segment cursor bound.
+  const totalWeight = segs.reduce((sum, seg) => sum + segmentGenWeight(seg), 0);
+  await setJobTotal(jobId, totalWeight);
   await db
     .update(chapters)
     .set({ status: "generating", error: null })
@@ -130,6 +141,10 @@ export async function renderBatch(
   let chainVoiceId = chain?.voiceId ?? null;
   let chainRequestIds = chain?.requestIds ?? [];
   let chars = charsBefore;
+  // Progress is character-weighted (render time ∝ text). Seed from the segments
+  // already rendered by prior batches; segs is the full ordered list.
+  let doneChars = 0;
+  for (let j = 0; j < fromIdx; j++) doneChars += segmentGenWeight(segs[j]);
 
   for (let i = fromIdx; i < segs.length; i++) {
     // Stop spending credits promptly on cancel
@@ -169,8 +184,9 @@ export async function renderBatch(
         .set({ audioPath: relPath, durationSec: segmentAudioDurationSec(sfxAudio) })
         .where(eq(segments.id, seg.id));
       if (fresh) chars += estimateSfxCredits(seconds);
+      doneChars += segmentGenWeight(seg);
       await setJobProgress(jobId, {
-        done: i + 1,
+        done: doneChars,
         charsUsed: chars,
         note: `Sound effect — ${seg.text}${fresh ? "" : " (cached)"}`,
       });
@@ -244,9 +260,10 @@ export async function renderBatch(
       .set({ audioPath: relPath, durationSec: segmentAudioDurationSec(segAudio) })
       .where(eq(segments.id, seg.id));
     chars += freshChars;
+    doneChars += segmentGenWeight(seg);
     const speaker = seg.characterId ? (nameById.get(seg.characterId) ?? "?") : "Narrator";
     await setJobProgress(jobId, {
-      done: i + 1,
+      done: doneChars,
       charsUsed: chars,
       note: `Segment ${i + 1}/${segs.length} — ${speaker}${freshChars === 0 ? " (cached)" : ""}`,
     });

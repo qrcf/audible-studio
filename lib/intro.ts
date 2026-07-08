@@ -5,7 +5,8 @@ import type { NarratorProfile } from "@/lib/db/schema";
 import { getAssignmentResolver, type Assignment } from "@/lib/generation";
 import { generateMusic, INTRO_MUSIC_PROMPT } from "@/lib/elevenlabs/music";
 import { ttsConvert } from "@/lib/elevenlabs/tts";
-import { concatMp3, firstFrameSampleRate, segmentAudioDurationSec } from "@/lib/audio/mp3";
+import { concatMp3, segmentAudioDurationSec } from "@/lib/audio/mp3";
+import { mixIntro } from "@/lib/audio/mix";
 import { deleteBlobs, readBlobIfExists, writeAudio } from "@/lib/storage";
 
 const INTRO_MUSIC_MS = 8000;
@@ -33,14 +34,16 @@ export interface IntroResult {
 }
 
 /**
- * Build (or reuse) the book's standalone intro section: a themed music bed
- * followed by the narrator speaking "{Title}, by {Author}." Stored on the book
- * as its own audio blob — never concatenated into a chapter — so it plays as
- * its own section and can be regenerated independently.
+ * Build (or reuse) the book's standalone intro section: the narrator speaking
+ * "{Title}, by {Author}" mixed over a themed music bed. Stored on the book as
+ * its own audio blob — never concatenated into a chapter — so it plays as its
+ * own section and can be regenerated independently.
  *
- * Music and speech are forced to the SAME sample rate; if the returned music
- * clip somehow differs, the music is dropped rather than shipping a section
- * where one half plays pitch-shifted and staticky.
+ * Music and speech are decoded, mixed as PCM (voice over a ducked bed), and
+ * re-encoded into one homogeneous stereo stream — byte-concat is off the table
+ * because the clips differ in channel mode, which players punish with
+ * pitch-shifted static. If the mix fails, the music is dropped rather than
+ * shipping a broken section.
  *
  * Returns null (and leaves the book unchanged) when the narrator isn't cast.
  */
@@ -66,7 +69,7 @@ export async function ensureBookIntro(bookId: string, force = false): Promise<In
         narrator.voiceId,
         narrator.settings,
         book.renderModel,
-        "intro-v2",
+        "intro-v3",
       ])
     )
     .digest("hex")
@@ -96,25 +99,24 @@ async function compose(
   narrator: Assignment,
   modelId: string
 ): Promise<Buffer> {
-  const [music, voice] = await Promise.all([
-    generateMusic(musicPrompt, INTRO_MUSIC_MS),
-    ttsConvert({
-      voiceId: narrator.voiceId,
-      text: introText,
-      modelId, // speech is always mp3_44100_128 regardless of model
-      settings: narrator.settings,
-      seed: narrator.seed,
-    }),
-  ]);
+  const voicePromise = ttsConvert({
+    voiceId: narrator.voiceId,
+    text: introText,
+    modelId, // speech is always mp3_44100_128 regardless of model
+    settings: narrator.settings,
+    seed: narrator.seed,
+  });
 
-  const musicRate = firstFrameSampleRate(music);
-  const voiceRate = firstFrameSampleRate(voice.audio);
-  if (musicRate != null && musicRate === voiceRate) {
-    return concatMp3([music, voice.audio]).data;
+  try {
+    const [music, voice] = await Promise.all([
+      generateMusic(musicPrompt, INTRO_MUSIC_MS),
+      voicePromise,
+    ]);
+    return await mixIntro(music, voice.audio);
+  } catch (err) {
+    // A voice-only intro beats a failed job (or a broken-sounding one).
+    console.warn("Intro music/mix failed; dropping music bed to keep the title clear:", err);
+    const voice = await voicePromise;
+    return concatMp3([voice.audio]).data;
   }
-  // Rates disagree — byte-concat would make one half play pitch-shifted.
-  console.warn(
-    `Intro music rate (${musicRate}) != voice rate (${voiceRate}); dropping music bed to keep the title clear.`
-  );
-  return concatMp3([voice.audio]).data;
 }
