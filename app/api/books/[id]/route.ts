@@ -53,6 +53,7 @@ export async function PATCH(req: Request, { params }: Ctx) {
       author?: string | null;
       modelPrefs?: unknown;
       sfxEnabled?: unknown;
+      introMusicPrompt?: string | null;
     };
     const patch: Partial<{
       renderModel: string;
@@ -60,6 +61,7 @@ export async function PATCH(req: Request, { params }: Ctx) {
       author: string | null;
       modelPrefs: ModelPrefs;
       sfxEnabled: boolean;
+      introMusicPrompt: string | null;
     }> = {};
     if (body.renderModel) {
       if (!["eleven_v3", "eleven_multilingual_v2", "eleven_flash_v2_5"].includes(body.renderModel)) {
@@ -82,6 +84,11 @@ export async function PATCH(req: Request, { params }: Ctx) {
     if (body.author !== undefined) {
       const author = typeof body.author === "string" ? body.author.trim() : "";
       patch.author = author || null;
+    }
+    if (body.introMusicPrompt !== undefined) {
+      const prompt =
+        typeof body.introMusicPrompt === "string" ? body.introMusicPrompt.trim() : "";
+      patch.introMusicPrompt = prompt || null;
     }
     await getDb().update(books).set(patch).where(eq(books.id, id));
     return Response.json({ ok: true });

@@ -78,6 +78,7 @@ export default async function BookPage({ params }: { params: Promise<{ id: strin
     sourceFileName: book.sourceFileName,
     introAudioPath: book.introAudioPath,
     introDurationSec: book.introDurationSec,
+    introMusicPrompt: book.introMusicPrompt,
     error: book.error,
   };
 

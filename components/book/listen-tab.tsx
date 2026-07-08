@@ -34,6 +34,7 @@ import { cn } from "@/lib/utils";
 import { formatDuration } from "@/lib/format";
 import { speakerColor } from "./speaker-colors";
 import { useReadOnly } from "./read-only";
+import { IntroMusicDialog } from "./intro-music-dialog";
 import type { BookData, ChapterMeta, JobData } from "./types";
 
 function saveBlob(blob: Blob, filename: string) {
@@ -652,9 +653,12 @@ export function ListenTab({
                   )}
                 </div>
                 {!readOnly && !introBusy && (
-                  <Button variant="outline" size="sm" onClick={generateIntro}>
-                    <Music className="h-3.5 w-3.5" /> Generate intro
-                  </Button>
+                  <>
+                    <IntroMusicDialog book={book} />
+                    <Button variant="outline" size="sm" onClick={generateIntro}>
+                      <Music className="h-3.5 w-3.5" /> Generate intro
+                    </Button>
+                  </>
                 )}
               </div>
             );
@@ -708,6 +712,7 @@ export function ListenTab({
             <span className="font-mono text-xs text-muted-foreground">
               {ch.durationSec ? formatDuration(ch.durationSec) : ""}
             </span>
+            {!readOnly && isIntro && <IntroMusicDialog book={book} />}
             {!readOnly && isIntro && (
               <Button
                 variant="ghost"

@@ -84,6 +84,9 @@ export const books = pgTable("books", {
   // own and its sample rate never contaminates chapter playback.
   introAudioPath: text("intro_audio_path"),
   introDurationSec: doublePrecision("intro_duration_sec"),
+  // Optional user-written instrumental brief for the intro music bed. When set,
+  // it overrides the auto-derived (narrator-profile) prompt in ensureBookIntro.
+  introMusicPrompt: text("intro_music_prompt"),
   error: text("error"),
   // Workflow run driving the current book-wide operation, if any
   activeRunId: text("active_run_id"),

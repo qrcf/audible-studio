@@ -1,0 +1,1 @@
+ALTER TABLE "books" ADD COLUMN "intro_music_prompt" text;

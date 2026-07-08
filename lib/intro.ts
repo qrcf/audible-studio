@@ -54,7 +54,10 @@ export async function ensureBookIntro(bookId: string, force = false): Promise<In
   if (!narrator) return null; // narrator uncast — no intro yet
 
   const introText = book.author ? `${book.title}, by ${book.author}.` : `${book.title}.`;
-  const musicPrompt = musicPromptFor(book.title, book.narratorProfile);
+  // A user-written brief wins over the auto-derived one. It's part of the cache
+  // key below, so editing it regenerates the section on the next ensure/force.
+  const musicPrompt =
+    book.introMusicPrompt?.trim() || musicPromptFor(book.title, book.narratorProfile);
   const key = createHash("sha256")
     .update(
       JSON.stringify([

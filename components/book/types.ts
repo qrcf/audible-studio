@@ -16,6 +16,7 @@ export interface BookData {
   sourceFileName: string;
   introAudioPath: string | null;
   introDurationSec: number | null;
+  introMusicPrompt: string | null;
   error: string | null;
 }
 
