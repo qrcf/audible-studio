@@ -78,7 +78,7 @@ export async function deleteBlobs(pathnames: string | string[]): Promise<void> {
 }
 
 export async function deleteBookAudio(bookId: string): Promise<void> {
-  for (const prefix of [`segments/${bookId}/`, `chapters/${bookId}/`]) {
+  for (const prefix of [`segments/${bookId}/`, `chapters/${bookId}/`, `intro/${bookId}/`]) {
     let cursor: string | undefined;
     do {
       const page = await list({ prefix, cursor, limit: 1000 });

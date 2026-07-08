@@ -52,6 +52,16 @@ export function deliveryTag(d: Delivery | null): string {
   return d ? `${V3_TAGS[d]} ` : "";
 }
 
+/**
+ * Trailing pause to append after the spoken chapter-title announcement so it
+ * doesn't run into the first line. The syntax is model-specific (probed live):
+ * v3 ignores `<break>` but honors the `[pause]` audio tag (~2.3s); v2 models
+ * honor the time-scalable `<break>` tag.
+ */
+export function pauseSuffix(modelId: string): string {
+  return isV3(modelId) ? " [pause]" : ' <break time="1.5s" />';
+}
+
 // v2 models can't read tags — nudge the character's voice settings instead.
 const V2_DELTAS: Record<Delivery, { stability: number; style: number; speed: number }> = {
   whisper: { stability: 0.05, style: 0.1, speed: -0.05 },

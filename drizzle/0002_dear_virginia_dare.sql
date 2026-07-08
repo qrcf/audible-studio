@@ -1,0 +1,1 @@
+ALTER TABLE "chapters" ADD COLUMN "intro_duration_sec" double precision;

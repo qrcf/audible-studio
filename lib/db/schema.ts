@@ -101,6 +101,10 @@ export const chapters = pgTable(
     status: text("status").$type<ChapterStatus>().notNull().default("pending"),
     audioPath: text("audio_path"),
     durationSec: doublePrecision("duration_sec"),
+    // Length of the prepended book intro (music + title/author) on the first
+    // chapter — read-along offsets its segment start times by this. Null when
+    // this chapter has no intro.
+    introDurationSec: doublePrecision("intro_duration_sec"),
     error: text("error"),
   },
   (t) => [index("chapters_book_id_idx").on(t.bookId)]

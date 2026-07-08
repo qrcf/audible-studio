@@ -31,6 +31,9 @@ const chunkSchema = z.object({
 
 const mergeSchema = z.object({
   pov: z.enum(["first", "third"]).describe("Narrative point of view of the prose"),
+  author: z
+    .string()
+    .describe("The book's author as stated in the text (title page, byline); empty string if none"),
   narrator: z.object({
     description: z.string().describe("Who/what the narrating voice is"),
     tone: z.string().describe("Tone of the prose, e.g. 'wry, warm, unhurried'"),
@@ -70,6 +73,12 @@ const mergeSchema = z.object({
               .describe("Life stage: child | teen | young adult | adult | middle-aged | elderly"),
             ageRange: z.string().describe("Age at this stage, e.g. '8-10'"),
             speechStyle: z.string().describe("How they talk at this stage; empty to inherit"),
+            voiceTexture: z
+              .string()
+              .describe(
+                "Physical voice qualities AT THIS STAGE (a child's light, high voice vs. an adult's fuller one); empty to inherit"
+              ),
+            accentHint: z.string().describe("Accent/dialect AT THIS STAGE; empty to inherit"),
             dialogueShare: z
               .number()
               .min(0)
@@ -157,9 +166,13 @@ export async function mergeCastLlm(
       `(explicit descriptions, dialect, corroborated names/setting) — empty strings when there is none; never guess from a name alone.\n` +
       `- If and ONLY if a character clearly speaks dialogue at distinctly different life stages ` +
       `(e.g. chapters set years apart), list 2-4 ageVariants using labels from: child, teen, young adult, adult, ` +
-      `middle-aged, elderly — each with its own dialogueShare and quotes from that stage. Leave ageVariants empty ` +
-      `for everyone else; do not split for minor aging within one stage. Variants count toward the 40-character cap.\n` +
-      `- Also describe the narrating voice of the prose (not a character unless the book is first-person).\n\n` +
+      `middle-aged, elderly — each with its own dialogueShare and quotes from that stage, PLUS that stage's own ` +
+      `speechStyle, voiceTexture, and accentHint. For such a character keep the top-level speechStyle/voiceTexture/` +
+      `accentHint age-NEUTRAL — describe only what holds across their whole life and NEVER qualify with a stage ` +
+      `(no "as an adult" / "as a child"); anything stage-specific goes in that variant's own fields. Leave ageVariants ` +
+      `empty for everyone else; do not split for minor aging within one stage. Variants count toward the 40-character cap.\n` +
+      `- Also describe the narrating voice of the prose (not a character unless the book is first-person).\n` +
+      `- Set author to the book's author if the text states it (title page, "by ...", byline); empty string if unknown.\n\n` +
       JSON.stringify(chunkResults),
   });
   return merged.object;
@@ -175,7 +188,7 @@ export async function reconcileCast(
   merged: MergedCast,
   openingText: string
 ): Promise<void> {
-  const { pov, narrator, characters: cast } = merged;
+  const { pov, author, narrator, characters: cast } = merged;
   const db = getDb();
   await db.transaction(async (tx) => {
     // Snapshot the outgoing cast so re-analysis is non-destructive.
@@ -233,6 +246,8 @@ export async function reconcileCast(
               ...baseProfile,
               ageRange: v.ageRange,
               ...(v.speechStyle.trim() ? { speechStyle: v.speechStyle } : {}),
+              ...(v.voiceTexture.trim() ? { voiceTexture: v.voiceTexture } : {}),
+              ...(v.accentHint.trim() ? { accentHint: v.accentHint } : {}),
             },
             quotes: (v.quotes.length > 0 ? v.quotes : c.quotes).map((q) => q.slice(0, 300)),
             dialogueShare: v.dialogueShare,
@@ -380,7 +395,13 @@ export async function reconcileCast(
 
     await tx
       .update(books)
-      .set({ povType: pov, narratorProfile: narrator, status: "analyzed", error: null })
+      .set({
+        povType: pov,
+        author: author.trim() || null,
+        narratorProfile: narrator,
+        status: "analyzed",
+        error: null,
+      })
       .where(eq(books.id, bookId));
   });
 }
