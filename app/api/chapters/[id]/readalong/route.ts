@@ -1,45 +1,54 @@
 import { asc, eq } from "drizzle-orm";
-import { db, chapters, characters, segments } from "@/lib/db";
+import { getDb, chapters, characters, segments } from "@/lib/db";
 import { errorResponse, AppError } from "@/lib/errors";
-import { audioExists, readAudio } from "@/lib/paths";
-import { segmentAudioDurationSec } from "@/lib/audio/mp3";
+import { cleanChapterText, titleAnnouncement } from "@/lib/analysis/clean";
 
 /**
- * The chapter MP3 is a CBR byte-concatenation of the per-segment cache files,
- * so each segment's start time is exact file-size math — no transcription
- * needed. Timing stays valid for stale chapters too (their audio was built
- * from these same files).
+ * The chapter MP3 is a CBR byte-concatenation of the per-segment audio, and
+ * each segment's exact duration was captured at generation time
+ * (segments.durationSec) — start times are pure addition, no audio reads.
+ * Timing stays valid for stale chapters too (their audio was built from
+ * these same segments).
  */
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params;
-    const chapter = db.select().from(chapters).where(eq(chapters.id, id)).get();
+    const db = getDb();
+    const [chapter] = await db.select().from(chapters).where(eq(chapters.id, id)).limit(1);
     if (!chapter) throw new AppError("Chapter not found", "not_found", 404);
     if (!chapter.audioPath) {
       throw new AppError("Generate this chapter first", "not_generated", 409);
     }
 
-    const segs = db
+    const segs = await db
       .select()
       .from(segments)
       .where(eq(segments.chapterId, id))
-      .orderBy(asc(segments.idx))
-      .all();
+      .orderBy(asc(segments.idx));
     if (segs.length === 0) throw new AppError("Chapter has no script", "not_scripted", 409);
 
     const nameById = new Map(
-      db
-        .select({ id: characters.id, name: characters.name })
-        .from(characters)
-        .where(eq(characters.bookId, chapter.bookId))
-        .all()
-        .map((c) => [c.id, c.name])
+      (
+        await db
+          .select({ id: characters.id, name: characters.name })
+          .from(characters)
+          .where(eq(characters.bookId, chapter.bookId))
+      ).map((c) => [c.id, c.name])
     );
+
+    // Segment texts are ordered (near-)exact substrings of the cleaned chapter
+    // text, so a monotonic indexOf walk recovers each segment's position and
+    // whether a paragraph break sits in the trimmed gap before it. The spoken
+    // title announcement and sfx rows aren't part of the chapter text.
+    const cleaned = cleanChapterText(chapter.text, chapter.title);
+    const announcement = titleAnnouncement(chapter.title);
+    let cursor = 0;
+    let anyMatched = false;
 
     let startSec = 0;
     const timed = [];
     for (const seg of segs) {
-      if (!seg.audioPath || !audioExists(seg.audioPath)) {
+      if (!seg.audioPath || seg.durationSec == null) {
         // Re-scripted since generation — the chapter audio no longer matches
         throw new AppError(
           "Read-along timing is out of date — regenerate this chapter",
@@ -47,7 +56,27 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
           409
         );
       }
-      const durationSec = segmentAudioDurationSec(readAudio(seg.audioPath));
+      const isTitle = seg.kind === "narration" && seg.text === announcement;
+      let paraBreakBefore = true;
+      // Whitespace between adjacent segments was trimmed at storage, so
+      // recover whether an inline space belongs before this segment (else
+      // `"Well now,"he rumbled` renders with no gap).
+      let spaceBefore = false;
+      if (seg.kind !== "sfx" && !isTitle) {
+        const at = cleaned.indexOf(seg.text, cursor);
+        if (at >= 0) {
+          const gap = cleaned.slice(cursor, at);
+          paraBreakBefore = !anyMatched || /\n\s*\n/.test(gap);
+          spaceBefore = !paraBreakBefore && gap.length > 0;
+          cursor = at + seg.text.length;
+          anyMatched = true;
+        } else {
+          // Merged-dialogue " " insert or \n\n\n rejoin — degrade gracefully
+          paraBreakBefore = seg.kind === "narration";
+          spaceBefore = !paraBreakBefore;
+        }
+      }
+      const durationSec = seg.durationSec;
       timed.push({
         id: seg.id,
         idx: seg.idx,
@@ -62,6 +91,9 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
         text: seg.text,
         startSec,
         durationSec,
+        paraBreakBefore,
+        spaceBefore,
+        isTitle,
         phrases: timePhrases(seg.text, startSec, durationSec),
       });
       startSec += durationSec;

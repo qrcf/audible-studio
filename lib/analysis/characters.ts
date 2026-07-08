@@ -2,21 +2,12 @@ import { randomUUID } from "node:crypto";
 import { asc, eq, inArray } from "drizzle-orm";
 import { generateObject } from "ai";
 import { z } from "zod";
-import { db, books, chapters, characters, segments, voiceAssignments } from "@/lib/db";
+import { getDb, books, chapters, characters, segments, voiceAssignments } from "@/lib/db";
 import type { CharacterProfile } from "@/lib/db/schema";
 import { chunkText, getModel } from "@/lib/llm";
-import {
-  assertNotCancelled,
-  completeJob,
-  failJob,
-  noteJob,
-  setJobTotal,
-  tickJob,
-} from "@/lib/jobs";
-import { JobCancelledError } from "@/lib/errors";
 
-const CHUNK_SIZE = 24_000;
-const LLM_CONCURRENCY = 3;
+export const CHUNK_SIZE = 24_000;
+export const LLM_CONCURRENCY = 3;
 
 const chunkSchema = z.object({
   characters: z.array(
@@ -97,304 +88,301 @@ const mergeSchema = z.object({
   ),
 });
 
-export async function runAnalysis(bookId: string, jobId: string): Promise<void> {
-  try {
-    const book = db.select().from(books).where(eq(books.id, bookId)).get();
-    if (!book) throw new Error("Book not found");
-    const bookChapters = db
-      .select({ text: chapters.text })
-      .from(chapters)
-      .where(eq(chapters.bookId, bookId))
-      .orderBy(asc(chapters.idx))
-      .all();
+export type ChunkExtraction = z.infer<typeof chunkSchema>;
+export type MergedCast = z.infer<typeof mergeSchema>;
 
-    const fullText = bookChapters.map((c) => c.text).join("\n\n");
-    const chunks = chunkText(fullText, CHUNK_SIZE);
-    setJobTotal(jobId, chunks.length + 1);
+/**
+ * Book + deterministically-derived chunks. Workflow steps call this instead
+ * of shipping the full text between steps — chunking is pure, so every step
+ * sees identical boundaries.
+ */
+export async function loadAnalysisContext(bookId: string) {
+  const db = getDb();
+  const [book] = await db.select().from(books).where(eq(books.id, bookId)).limit(1);
+  if (!book) throw new Error("Book not found");
+  const bookChapters = await db
+    .select({ text: chapters.text })
+    .from(chapters)
+    .where(eq(chapters.bookId, bookId))
+    .orderBy(asc(chapters.idx));
+  const fullText = bookChapters.map((c) => c.text).join("\n\n");
+  return {
+    book,
+    chunks: chunkText(fullText, CHUNK_SIZE),
+    fullTextLength: fullText.length,
+    openingText: bookChapters[0]?.text.slice(0, 280) ?? "",
+  };
+}
 
-    // Map: extract character mentions per chunk (small concurrent pool)
-    const chunkResults: z.infer<typeof chunkSchema>[] = new Array(chunks.length);
-    let next = 0;
-    async function worker() {
-      while (next < chunks.length) {
-        assertNotCancelled(jobId);
-        const i = next++;
-        const { object } = await generateObject({
-          model: getModel("analyze", book!.modelPrefs),
-          schema: chunkSchema,
-          prompt:
-            `This is excerpt ${i + 1} of ${chunks.length} from the book "${book!.title}". ` +
-            `List every character who speaks dialogue or plays a meaningful part in this excerpt. ` +
-            `Quotes must be copied VERBATIM from the text (dialogue only, no narration). ` +
-            `In voiceEvidence, note anything the text says about how they SOUND — accent, dialect, ` +
-            `ethnicity or nationality, physical voice descriptions — and whether they appear at ` +
-            `distinctly different ages in this excerpt vs. elsewhere. ` +
-            `Skip characters who are only mentioned in passing.\n\n---\n\n${chunks[i]}`,
-        });
-        chunkResults[i] = object;
-        const names = new Set<string>();
-        for (const r of chunkResults) {
-          if (r) for (const c of r.characters) names.add(c.name.toLowerCase());
-        }
-        const done = chunkResults.filter(Boolean).length;
-        tickJob(jobId, {
-          note: `Reading section ${done}/${chunks.length} — ${names.size} characters so far`,
-        });
-      }
+/** Map phase: extract character mentions from one chunk. */
+export async function analyzeChunkLlm(
+  book: typeof books.$inferSelect,
+  chunks: string[],
+  i: number
+): Promise<ChunkExtraction> {
+  const { object } = await generateObject({
+    model: getModel("analyze", book.modelPrefs),
+    schema: chunkSchema,
+    prompt:
+      `This is excerpt ${i + 1} of ${chunks.length} from the book "${book.title}". ` +
+      `List every character who speaks dialogue or plays a meaningful part in this excerpt. ` +
+      `Quotes must be copied VERBATIM from the text (dialogue only, no narration). ` +
+      `In voiceEvidence, note anything the text says about how they SOUND — accent, dialect, ` +
+      `ethnicity or nationality, physical voice descriptions — and whether they appear at ` +
+      `distinctly different ages in this excerpt vs. elsewhere. ` +
+      `Skip characters who are only mentioned in passing.\n\n---\n\n${chunks[i]}`,
+  });
+  return object;
+}
+
+/** Reduce phase: merge chunk extractions into the final cast list. */
+export async function mergeCastLlm(
+  book: typeof books.$inferSelect,
+  chunkResults: ChunkExtraction[],
+  fullTextLength: number
+): Promise<MergedCast> {
+  const merged = await generateObject({
+    model: getModel("analyze", book.modelPrefs),
+    schema: mergeSchema,
+    prompt:
+      `Below are per-excerpt character extractions from the book "${book.title}" ` +
+      `(${chunkResults.length} excerpts, ${fullTextLength.toLocaleString()} characters of text). ` +
+      `Merge them into one final cast list:\n` +
+      `- Merge entries that are the same person under different names; put alternate names in aliases.\n` +
+      `- role "major" for characters with substantial recurring dialogue, "minor" otherwise.\n` +
+      `- Keep every character who speaks more than once or twice; at most 40 characters total.\n` +
+      `- dialogueShare values should roughly sum to 1 across all characters.\n` +
+      `- For each, pick their 3-5 most characterful VERBATIM quotes from the extractions.\n` +
+      `- For EVERY character (including minors), fill heritage and voiceTexture strictly from textual evidence ` +
+      `(explicit descriptions, dialect, corroborated names/setting) — empty strings when there is none; never guess from a name alone.\n` +
+      `- If and ONLY if a character clearly speaks dialogue at distinctly different life stages ` +
+      `(e.g. chapters set years apart), list 2-4 ageVariants using labels from: child, teen, young adult, adult, ` +
+      `middle-aged, elderly — each with its own dialogueShare and quotes from that stage. Leave ageVariants empty ` +
+      `for everyone else; do not split for minor aging within one stage. Variants count toward the 40-character cap.\n` +
+      `- Also describe the narrating voice of the prose (not a character unless the book is first-person).\n\n` +
+      JSON.stringify(chunkResults),
+  });
+  return merged.object;
+}
+
+/**
+ * Replace the book's cast with the merged result, non-destructively: voice
+ * assignments and script attributions re-attach wherever a character's name
+ * (or alias) still matches. Sets the book analyzed.
+ */
+export async function reconcileCast(
+  bookId: string,
+  merged: MergedCast,
+  openingText: string
+): Promise<void> {
+  const { pov, narrator, characters: cast } = merged;
+  const db = getDb();
+  await db.transaction(async (tx) => {
+    // Snapshot the outgoing cast so re-analysis is non-destructive.
+    const oldCast = await tx.select().from(characters).where(eq(characters.bookId, bookId));
+    const oldAssignments = oldCast.length
+      ? await tx
+          .select()
+          .from(voiceAssignments)
+          .where(inArray(voiceAssignments.characterId, oldCast.map((c) => c.id)))
+      : [];
+    const oldSegments = oldCast.length
+      ? await tx
+          .select({ id: segments.id, characterId: segments.characterId })
+          .from(segments)
+          .innerJoin(chapters, eq(segments.chapterId, chapters.id))
+          .where(eq(chapters.bookId, bookId))
+      : [];
+
+    await tx.delete(characters).where(eq(characters.bookId, bookId));
+
+    // Expand the merged cast into row specs: a character with clearly
+    // distinct life stages becomes sibling variant rows ("Hugo Pitts (child)")
+    // sharing a variantGroup. Naming/alias invariants are enforced here in
+    // code — the name-preservation machinery depends on them.
+    interface RowSpec {
+      name: string;
+      aliases: string[];
+      role: "major" | "minor";
+      profile: CharacterProfile;
+      quotes: string[];
+      dialogueShare: number;
+      variantGroup: string | null;
+      variantLabel: string | null;
     }
-    await Promise.all(
-      Array.from({ length: Math.min(LLM_CONCURRENCY, chunks.length) }, worker)
-    );
-
-    // Reduce: merge and dedupe into the final cast
-    assertNotCancelled(jobId);
-    noteJob(jobId, "Merging cast list…");
-    const merged = await generateObject({
-      model: getModel("analyze", book.modelPrefs),
-      schema: mergeSchema,
-      prompt:
-        `Below are per-excerpt character extractions from the book "${book.title}" ` +
-        `(${chunks.length} excerpts, ${fullText.length.toLocaleString()} characters of text). ` +
-        `Merge them into one final cast list:\n` +
-        `- Merge entries that are the same person under different names; put alternate names in aliases.\n` +
-        `- role "major" for characters with substantial recurring dialogue, "minor" otherwise.\n` +
-        `- Keep every character who speaks more than once or twice; at most 40 characters total.\n` +
-        `- dialogueShare values should roughly sum to 1 across all characters.\n` +
-        `- For each, pick their 3-5 most characterful VERBATIM quotes from the extractions.\n` +
-        `- For EVERY character (including minors), fill heritage and voiceTexture strictly from textual evidence ` +
-        `(explicit descriptions, dialect, corroborated names/setting) — empty strings when there is none; never guess from a name alone.\n` +
-        `- If and ONLY if a character clearly speaks dialogue at distinctly different life stages ` +
-        `(e.g. chapters set years apart), list 2-4 ageVariants using labels from: child, teen, young adult, adult, ` +
-        `middle-aged, elderly — each with its own dialogueShare and quotes from that stage. Leave ageVariants empty ` +
-        `for everyone else; do not split for minor aging within one stage. Variants count toward the 40-character cap.\n` +
-        `- Also describe the narrating voice of the prose (not a character unless the book is first-person).\n\n` +
-        JSON.stringify(chunkResults),
-    });
-    const { pov, narrator, characters: cast } = merged.object;
-    tickJob(jobId, { note: `Found ${cast.length} characters` });
-    const openingText = bookChapters[0]?.text.slice(0, 280) ?? "";
-
-    db.transaction((tx) => {
-      // Snapshot the outgoing cast so re-analysis is non-destructive: voice
-      // assignments and script attributions are re-attached below wherever a
-      // character's name (or alias) still matches.
-      const oldCast = tx.select().from(characters).where(eq(characters.bookId, bookId)).all();
-      const oldAssignments = oldCast.length
-        ? tx
-            .select()
-            .from(voiceAssignments)
-            .where(inArray(voiceAssignments.characterId, oldCast.map((c) => c.id)))
-            .all()
-        : [];
-      const oldSegments = oldCast.length
-        ? tx
-            .select({ id: segments.id, characterId: segments.characterId })
-            .from(segments)
-            .innerJoin(chapters, eq(segments.chapterId, chapters.id))
-            .where(eq(chapters.bookId, bookId))
-            .all()
-        : [];
-
-      tx.delete(characters).where(eq(characters.bookId, bookId)).run();
-
-      // Expand the merged cast into row specs: a character with clearly
-      // distinct life stages becomes sibling variant rows ("Hugo Pitts (child)")
-      // sharing a variantGroup. Naming/alias invariants are enforced here in
-      // code — the name-preservation machinery depends on them.
-      interface RowSpec {
-        name: string;
-        aliases: string[];
-        role: "major" | "minor";
-        profile: CharacterProfile;
-        quotes: string[];
-        dialogueShare: number;
-        variantGroup: string | null;
-        variantLabel: string | null;
-      }
-      const specs: RowSpec[] = [];
-      for (const c of cast) {
-        const baseProfile: CharacterProfile = {
-          gender: c.gender,
-          ageRange: c.ageRange,
-          personality: c.personality,
-          speechStyle: c.speechStyle,
-          accentHint: c.accentHint,
-          heritage: c.heritage,
-          voiceTexture: c.voiceTexture,
-        };
-        if (c.ageVariants.length >= 2) {
-          for (const v of c.ageVariants) {
-            const label = v.label.trim().toLowerCase();
-            const name = `${c.name} (${label})`;
-            specs.push({
-              name,
-              aliases: dedupeAliases([c.name, ...c.aliases], name),
-              role: c.role,
-              profile: {
-                ...baseProfile,
-                ageRange: v.ageRange,
-                ...(v.speechStyle.trim() ? { speechStyle: v.speechStyle } : {}),
-              },
-              quotes: (v.quotes.length > 0 ? v.quotes : c.quotes).map((q) => q.slice(0, 300)),
-              dialogueShare: v.dialogueShare,
-              variantGroup: c.name,
-              variantLabel: label,
-            });
-          }
-        } else {
+    const specs: RowSpec[] = [];
+    for (const c of cast) {
+      const baseProfile: CharacterProfile = {
+        gender: c.gender,
+        ageRange: c.ageRange,
+        personality: c.personality,
+        speechStyle: c.speechStyle,
+        accentHint: c.accentHint,
+        heritage: c.heritage,
+        voiceTexture: c.voiceTexture,
+      };
+      if (c.ageVariants.length >= 2) {
+        for (const v of c.ageVariants) {
+          const label = v.label.trim().toLowerCase();
+          const name = `${c.name} (${label})`;
           specs.push({
-            name: c.name,
-            aliases: dedupeAliases(c.aliases, c.name),
+            name,
+            aliases: dedupeAliases([c.name, ...c.aliases], name),
             role: c.role,
-            profile: baseProfile,
-            quotes: c.quotes.map((q) => q.slice(0, 300)),
-            dialogueShare: c.dialogueShare,
-            variantGroup: null,
-            variantLabel: null,
+            profile: {
+              ...baseProfile,
+              ageRange: v.ageRange,
+              ...(v.speechStyle.trim() ? { speechStyle: v.speechStyle } : {}),
+            },
+            quotes: (v.quotes.length > 0 ? v.quotes : c.quotes).map((q) => q.slice(0, 300)),
+            dialogueShare: v.dialogueShare,
+            variantGroup: c.name,
+            variantLabel: label,
           });
         }
+      } else {
+        specs.push({
+          name: c.name,
+          aliases: dedupeAliases(c.aliases, c.name),
+          role: c.role,
+          profile: baseProfile,
+          quotes: c.quotes.map((q) => q.slice(0, 300)),
+          dialogueShare: c.dialogueShare,
+          variantGroup: null,
+          variantLabel: null,
+        });
       }
-      // Dominant-first: under first-wins registration, the highest-share
-      // variant claims the shared base-name alias (and thus inherits the old
-      // row's assignment + segments on re-analysis).
-      specs.sort((a, b) => b.dialogueShare - a.dialogueShare);
-
-      const newIdByName = new Map<string, string>();
-      const register = (name: string, id: string) => {
-        const key = name.trim().toLowerCase();
-        if (key && !newIdByName.has(key)) newIdByName.set(key, id);
-      };
-
-      const narratorId = randomUUID();
-      tx.insert(characters)
-        .values({
-          id: narratorId,
-          bookId,
-          name: "Narrator",
-          aliases: [],
-          role: "narrator",
-          profile: {
-            gender: narrator.genderSuggestion === "neutral" ? "unknown" : narrator.genderSuggestion,
-            ageRange: "adult",
-            personality: narrator.description,
-            speechStyle: narrator.tone,
-            accentHint: "",
-          },
-          quotes: openingText ? [openingText] : [],
-          dialogueShare: 0,
-          isNarrator: true,
-        })
-        .run();
-      register("Narrator", narratorId);
-
-      const inserted: { spec: RowSpec; id: string }[] = [];
-      for (const spec of specs) {
-        const id = randomUUID();
-        tx.insert(characters)
-          .values({
-            id,
-            bookId,
-            name: spec.name,
-            aliases: spec.aliases,
-            role: spec.role,
-            profile: spec.profile,
-            quotes: spec.quotes,
-            dialogueShare: spec.dialogueShare,
-            isNarrator: false,
-            variantGroup: spec.variantGroup,
-            variantLabel: spec.variantLabel,
-          })
-          .run();
-        inserted.push({ spec, id });
-      }
-      // Two-pass registration so an exact name can never be shadowed by
-      // another character's alias.
-      for (const { spec, id } of inserted) register(spec.name, id);
-      for (const { spec, id } of inserted) {
-        for (const alias of spec.aliases) register(alias, id);
-      }
-
-      // User-edited profiles survive re-analysis, but only on an exact name
-      // match — an alias match would clobber a variant's per-stage ageRange.
-      const idByExactName = new Map(inserted.map(({ spec, id }) => [spec.name.toLowerCase(), id]));
-      for (const old of oldCast) {
-        if (!old.profileEdited || old.isNarrator) continue;
-        const newId = idByExactName.get(old.name.toLowerCase());
-        if (newId) {
-          tx.update(characters)
-            .set({ profile: old.profile, profileEdited: true })
-            .where(eq(characters.id, newId))
-            .run();
-        }
-      }
-
-      const matchNewId = (old: (typeof oldCast)[number]): string | undefined => {
-        for (const name of [old.name, ...old.aliases]) {
-          const id = newIdByName.get(name.trim().toLowerCase());
-          if (id) return id;
-        }
-        return undefined;
-      };
-
-      // Voice assignments carry over by name; manual overrides win merges.
-      // Label drift ("boy" → "child") degrades gracefully: both old variants
-      // alias-match the new dominant variant and the `taken` set keeps one.
-      const assignmentByOldId = new Map(oldAssignments.map((a) => [a.characterId, a]));
-      const taken = new Set<string>();
-      const oldByOverriddenFirst = [...oldCast].sort(
-        (a, b) =>
-          Number(assignmentByOldId.get(b.id)?.overridden ?? false) -
-          Number(assignmentByOldId.get(a.id)?.overridden ?? false)
-      );
-      for (const old of oldByOverriddenFirst) {
-        const assignment = assignmentByOldId.get(old.id);
-        const newId = matchNewId(old);
-        if (!assignment || !newId || taken.has(newId)) continue;
-        taken.add(newId);
-        tx.insert(voiceAssignments)
-          .values({ ...assignment, id: randomUUID(), characterId: newId })
-          .run();
-      }
-
-      // Re-point script segments (the cascade already nulled them); dialogue
-      // whose speaker vanished stays narrator-voiced but gets flagged.
-      const oldById = new Map(oldCast.map((c) => [c.id, c]));
-      for (const seg of oldSegments) {
-        if (!seg.characterId) continue;
-        const old = oldById.get(seg.characterId);
-        const newId = old ? matchNewId(old) : undefined;
-        if (newId) {
-          tx.update(segments).set({ characterId: newId }).where(eq(segments.id, seg.id)).run();
-        } else {
-          tx.update(segments).set({ flagged: true }).where(eq(segments.id, seg.id)).run();
-        }
-      }
-
-      tx.update(books)
-        .set({ povType: pov, narratorProfile: narrator, status: "analyzed", error: null })
-        .where(eq(books.id, bookId))
-        .run();
-    });
-
-    completeJob(jobId);
-  } catch (err) {
-    if (err instanceof JobCancelledError) {
-      const hasCharacters =
-        db.select({ id: characters.id }).from(characters).where(eq(characters.bookId, bookId)).limit(1).all()
-          .length > 0;
-      db.update(books)
-        .set({ status: hasCharacters ? "analyzed" : "parsed", error: null })
-        .where(eq(books.id, bookId))
-        .run();
-      return;
     }
-    console.error("Analysis failed:", err);
-    failJob(jobId, err);
-    db.update(books)
-      .set({ status: "error", error: err instanceof Error ? err.message : String(err) })
-      .where(eq(books.id, bookId))
-      .run();
-  }
+    // Dominant-first: under first-wins registration, the highest-share
+    // variant claims the shared base-name alias (and thus inherits the old
+    // row's assignment + segments on re-analysis).
+    specs.sort((a, b) => b.dialogueShare - a.dialogueShare);
+
+    const newIdByName = new Map<string, string>();
+    const register = (name: string, id: string) => {
+      const key = name.trim().toLowerCase();
+      if (key && !newIdByName.has(key)) newIdByName.set(key, id);
+    };
+
+    const narratorId = randomUUID();
+    const inserted = specs.map((spec) => ({ spec, id: randomUUID() }));
+    await tx.insert(characters).values([
+      {
+        id: narratorId,
+        bookId,
+        name: "Narrator",
+        aliases: [],
+        role: "narrator" as const,
+        profile: {
+          gender:
+            narrator.genderSuggestion === "neutral"
+              ? ("unknown" as const)
+              : narrator.genderSuggestion,
+          ageRange: "adult",
+          personality: narrator.description,
+          speechStyle: narrator.tone,
+          accentHint: "",
+        },
+        quotes: openingText ? [openingText] : [],
+        dialogueShare: 0,
+        isNarrator: true,
+      },
+      ...inserted.map(({ spec, id }) => ({
+        id,
+        bookId,
+        name: spec.name,
+        aliases: spec.aliases,
+        role: spec.role,
+        profile: spec.profile,
+        quotes: spec.quotes,
+        dialogueShare: spec.dialogueShare,
+        isNarrator: false,
+        variantGroup: spec.variantGroup,
+        variantLabel: spec.variantLabel,
+      })),
+    ]);
+    register("Narrator", narratorId);
+
+    // Two-pass registration so an exact name can never be shadowed by
+    // another character's alias.
+    for (const { spec, id } of inserted) register(spec.name, id);
+    for (const { spec, id } of inserted) {
+      for (const alias of spec.aliases) register(alias, id);
+    }
+
+    // User-edited profiles survive re-analysis, but only on an exact name
+    // match — an alias match would clobber a variant's per-stage ageRange.
+    const idByExactName = new Map(inserted.map(({ spec, id }) => [spec.name.toLowerCase(), id]));
+    for (const old of oldCast) {
+      if (!old.profileEdited || old.isNarrator) continue;
+      const newId = idByExactName.get(old.name.toLowerCase());
+      if (newId) {
+        await tx
+          .update(characters)
+          .set({ profile: old.profile, profileEdited: true })
+          .where(eq(characters.id, newId));
+      }
+    }
+
+    const matchNewId = (old: (typeof oldCast)[number]): string | undefined => {
+      for (const name of [old.name, ...old.aliases]) {
+        const id = newIdByName.get(name.trim().toLowerCase());
+        if (id) return id;
+      }
+      return undefined;
+    };
+
+    // Voice assignments carry over by name; manual overrides win merges.
+    // Label drift ("boy" → "child") degrades gracefully: both old variants
+    // alias-match the new dominant variant and the `taken` set keeps one.
+    const assignmentByOldId = new Map(oldAssignments.map((a) => [a.characterId, a]));
+    const taken = new Set<string>();
+    const oldByOverriddenFirst = [...oldCast].sort(
+      (a, b) =>
+        Number(assignmentByOldId.get(b.id)?.overridden ?? false) -
+        Number(assignmentByOldId.get(a.id)?.overridden ?? false)
+    );
+    const carriedAssignments: (typeof oldAssignments)[number][] = [];
+    for (const old of oldByOverriddenFirst) {
+      const assignment = assignmentByOldId.get(old.id);
+      const newId = matchNewId(old);
+      if (!assignment || !newId || taken.has(newId)) continue;
+      taken.add(newId);
+      carriedAssignments.push({ ...assignment, id: randomUUID(), characterId: newId });
+    }
+    if (carriedAssignments.length > 0) {
+      await tx.insert(voiceAssignments).values(carriedAssignments);
+    }
+
+    // Re-point script segments (the cascade already nulled them); dialogue
+    // whose speaker vanished stays narrator-voiced but gets flagged.
+    const oldById = new Map(oldCast.map((c) => [c.id, c]));
+    const repointByNewId = new Map<string, string[]>();
+    const flaggedIds: string[] = [];
+    for (const seg of oldSegments) {
+      if (!seg.characterId) continue;
+      const old = oldById.get(seg.characterId);
+      const newId = old ? matchNewId(old) : undefined;
+      if (newId) {
+        const ids = repointByNewId.get(newId) ?? [];
+        ids.push(seg.id);
+        repointByNewId.set(newId, ids);
+      } else {
+        flaggedIds.push(seg.id);
+      }
+    }
+    for (const [newId, segIds] of repointByNewId) {
+      await tx.update(segments).set({ characterId: newId }).where(inArray(segments.id, segIds));
+    }
+    if (flaggedIds.length > 0) {
+      await tx.update(segments).set({ flagged: true }).where(inArray(segments.id, flaggedIds));
+    }
+
+    await tx
+      .update(books)
+      .set({ povType: pov, narratorProfile: narrator, status: "analyzed", error: null })
+      .where(eq(books.id, bookId));
+  });
 }
 
 /** Case-insensitive dedupe, excluding the row's own name. */

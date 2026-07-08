@@ -1,6 +1,6 @@
 import { eq } from "drizzle-orm";
 import { z } from "zod";
-import { db, chapters, characters, segments } from "@/lib/db";
+import { getDb, chapters, characters, segments } from "@/lib/db";
 import { errorResponse, AppError } from "@/lib/errors";
 import { DELIVERY_VALUES, type Delivery } from "@/lib/delivery";
 
@@ -17,12 +17,17 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
       throw new AppError("Nothing to update", "bad_request");
     }
 
-    const segment = db.select().from(segments).where(eq(segments.id, id)).get();
+    const db = getDb();
+    const [segment] = await db.select().from(segments).where(eq(segments.id, id)).limit(1);
     if (!segment) throw new AppError("Segment not found", "not_found", 404);
     if (segment.kind === "sfx") {
       throw new AppError("Sound-effect rows can only be deleted", "sfx_immutable", 409);
     }
-    const chapter = db.select().from(chapters).where(eq(chapters.id, segment.chapterId)).get();
+    const [chapter] = await db
+      .select()
+      .from(chapters)
+      .where(eq(chapters.id, segment.chapterId))
+      .limit(1);
     if (!chapter) throw new AppError("Chapter not found", "not_found", 404);
 
     const patch: Partial<{
@@ -35,11 +40,11 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
 
     if (body.characterId !== undefined) {
       if (body.characterId) {
-        const character = db
+        const [character] = await db
           .select({ id: characters.id, bookId: characters.bookId })
           .from(characters)
           .where(eq(characters.id, body.characterId))
-          .get();
+          .limit(1);
         if (!character || character.bookId !== chapter.bookId) {
           throw new AppError("Character not found in this book", "not_found", 404);
         }
@@ -57,11 +62,11 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
       patch.delivery = body.delivery;
     }
 
-    db.update(segments).set(patch).where(eq(segments.id, id)).run();
+    await db.update(segments).set(patch).where(eq(segments.id, id));
 
     // Existing chapter audio no longer matches the script
     if (chapter.status === "ready") {
-      db.update(chapters).set({ status: "stale" }).where(eq(chapters.id, chapter.id)).run();
+      await db.update(chapters).set({ status: "stale" }).where(eq(chapters.id, chapter.id));
     }
 
     return Response.json({ ok: true });
@@ -73,17 +78,22 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
 export async function DELETE(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params;
-    const segment = db.select().from(segments).where(eq(segments.id, id)).get();
+    const db = getDb();
+    const [segment] = await db.select().from(segments).where(eq(segments.id, id)).limit(1);
     if (!segment) throw new AppError("Segment not found", "not_found", 404);
     if (segment.kind !== "sfx") {
       // Deleting speech would silently drop book text
       throw new AppError("Only sound-effect rows can be deleted", "not_sfx", 409);
     }
-    const chapter = db.select().from(chapters).where(eq(chapters.id, segment.chapterId)).get();
+    const [chapter] = await db
+      .select()
+      .from(chapters)
+      .where(eq(chapters.id, segment.chapterId))
+      .limit(1);
 
-    db.delete(segments).where(eq(segments.id, id)).run();
+    await db.delete(segments).where(eq(segments.id, id));
     if (chapter?.status === "ready") {
-      db.update(chapters).set({ status: "stale" }).where(eq(chapters.id, chapter.id)).run();
+      await db.update(chapters).set({ status: "stale" }).where(eq(chapters.id, chapter.id));
     }
 
     return Response.json({ ok: true });

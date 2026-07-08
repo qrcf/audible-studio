@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import { ttsConvert, DEFAULT_SETTINGS } from "@/lib/elevenlabs/tts";
 import { errorResponse, AppError } from "@/lib/errors";
-import { audioExists, previewAudioPath, readAudio, writeAudio } from "@/lib/paths";
+import { previewAudioPath, readBlobIfExists, writeAudio } from "@/lib/storage";
 
 // Previews always render on flash (half the credits); plenty for auditioning voices.
 const PREVIEW_MODEL = "eleven_flash_v2_5";
@@ -36,12 +36,13 @@ export async function POST(req: Request) {
     const relPath = previewAudioPath(cacheKey);
 
     let audio: Buffer;
-    if (audioExists(relPath)) {
-      audio = readAudio(relPath);
+    const cached = await readBlobIfExists(relPath);
+    if (cached) {
+      audio = cached;
     } else {
       const result = await ttsConvert({ voiceId, text, modelId: PREVIEW_MODEL, settings });
       audio = result.audio;
-      writeAudio(relPath, audio);
+      await writeAudio(relPath, audio);
     }
 
     return new Response(new Uint8Array(audio), {

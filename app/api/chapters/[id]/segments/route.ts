@@ -1,16 +1,17 @@
 import { asc, eq } from "drizzle-orm";
-import { db, chapters, characters, segments } from "@/lib/db";
+import { getDb, chapters, characters, segments } from "@/lib/db";
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const chapter = db
+  const db = getDb();
+  const [chapter] = await db
     .select({ id: chapters.id, bookId: chapters.bookId })
     .from(chapters)
     .where(eq(chapters.id, id))
-    .get();
+    .limit(1);
   if (!chapter) return Response.json({ error: "Not found" }, { status: 404 });
 
-  const rows = db
+  const rows = await db
     .select({
       id: segments.id,
       idx: segments.idx,
@@ -24,14 +25,12 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     })
     .from(segments)
     .where(eq(segments.chapterId, id))
-    .orderBy(asc(segments.idx))
-    .all();
+    .orderBy(asc(segments.idx));
 
-  const cast = db
+  const cast = await db
     .select({ id: characters.id, name: characters.name, isNarrator: characters.isNarrator })
     .from(characters)
-    .where(eq(characters.bookId, chapter.bookId))
-    .all();
+    .where(eq(characters.bookId, chapter.bookId));
 
   return Response.json({
     segments: rows.map((r) => ({ ...r, hasAudio: Boolean(r.hasAudio) })),

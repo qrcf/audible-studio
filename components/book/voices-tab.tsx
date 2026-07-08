@@ -305,16 +305,23 @@ export function VoicesTab({
                       </TooltipContent>
                     </Tooltip>
                   </TableCell>
-                  <TableCell>
-                    <div className="flex items-center gap-1.5">
+                  <TableCell className="overflow-hidden">
+                    <div className="flex min-w-0 items-center gap-1.5">
                       <Select
                         value={assigned?.voiceId ?? ""}
                         onValueChange={(v) => changeVoice(c.id, v)}
                         disabled={saving === c.id || voices.length === 0}
                       >
-                        <SelectTrigger className="w-full">
+                        <SelectTrigger className="w-full min-w-0">
                           {saving === c.id ? (
                             <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : assigned ? (
+                            <span
+                              className="min-w-0 truncate"
+                              title={assignedVoice?.name ?? assigned.voiceName}
+                            >
+                              {assignedVoice?.name ?? assigned.voiceName}
+                            </span>
                           ) : (
                             <SelectValue placeholder="Pick a voice" />
                           )}
@@ -347,7 +354,10 @@ export function VoicesTab({
                             manual
                           </Badge>
                         )}
-                        <p className="line-clamp-2 min-w-0 text-xs text-muted-foreground">
+                        <p
+                          className="line-clamp-2 min-w-0 whitespace-normal text-xs text-muted-foreground"
+                          title={assigned.rationale ?? undefined}
+                        >
                           {assigned.rationale}
                         </p>
                       </div>

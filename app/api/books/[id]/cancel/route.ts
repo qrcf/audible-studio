@@ -1,31 +1,47 @@
-import { eq } from "drizzle-orm";
-import { db, books, characters } from "@/lib/db";
+import { and, eq, isNotNull } from "drizzle-orm";
+import { getRun } from "workflow/api";
+import { getDb, books, characters, jobs } from "@/lib/db";
 import { errorResponse, AppError } from "@/lib/errors";
 import { cancelBookJobs } from "@/lib/jobs";
 
 /**
  * Cancel everything in flight for a book: running jobs flip to "cancelled"
- * (workers notice between chunks/segments and unwind statuses themselves),
- * and the guided pipeline closes. Also resets book status defensively in
- * case a worker died without unwinding (e.g. dev-server restart).
+ * (workflow steps notice between chunks/segments and unwind statuses
+ * themselves), and the guided pipeline closes. Also cancels the underlying
+ * workflow runs as a backstop and resets book status defensively.
  */
 export async function POST(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params;
-    const book = db.select().from(books).where(eq(books.id, id)).get();
+    const db = getDb();
+    const [book] = await db.select().from(books).where(eq(books.id, id)).limit(1);
     if (!book) throw new AppError("Book not found", "not_found", 404);
 
-    const cancelled = cancelBookJobs(id);
-    db.update(books).set({ pipelineStage: null }).where(eq(books.id, id)).run();
+    // Collect the run ids of jobs about to be cancelled (backstop kill below)
+    const runIds = (
+      await db
+        .select({ runId: jobs.runId })
+        .from(jobs)
+        .where(and(eq(jobs.bookId, id), eq(jobs.status, "running"), isNotNull(jobs.runId)))
+    )
+      .map((j) => j.runId)
+      .filter((r): r is string => r !== null);
+    if (book.activeRunId) runIds.push(book.activeRunId);
+
+    const cancelled = await cancelBookJobs(id);
+    await db.update(books).set({ pipelineStage: null, activeRunId: null }).where(eq(books.id, id));
+    for (const runId of runIds) {
+      await getRun(runId).cancel().catch(() => {});
+    }
 
     if (book.status === "analyzing" || book.status === "casting") {
       const hasCharacters =
-        db.select({ id: characters.id }).from(characters).where(eq(characters.bookId, id)).limit(1).all()
+        (await db.select({ id: characters.id }).from(characters).where(eq(characters.bookId, id)).limit(1))
           .length > 0;
-      db.update(books)
+      await db
+        .update(books)
         .set({ status: hasCharacters ? "analyzed" : "parsed", error: null })
-        .where(eq(books.id, id))
-        .run();
+        .where(eq(books.id, id));
     }
 
     return Response.json({ cancelled });

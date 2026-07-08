@@ -2,9 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { generateObject } from "ai";
 import { z } from "zod";
-import { db, books, chapters, characters, segments } from "@/lib/db";
+import { getDb, books, chapters, characters, segments } from "@/lib/db";
 import { getModel } from "@/lib/llm";
-import { assertNotCancelled, setJobTotal, tickJob } from "@/lib/jobs";
 import { DELIVERY_VALUES, type Delivery } from "@/lib/delivery";
 import { cleanChapterText, titleAnnouncement } from "./clean";
 import { tokenizeQuotes, type TextSpan } from "./tokenize";
@@ -16,6 +15,8 @@ const CONTEXT_PAD = 400; // context shown around a chunk's quotes
 // cache stays fine-grained (one fix shouldn't re-render thousands of chars);
 // request-stitching makes the seams inaudible.
 const NARRATION_SPLIT = 2_800;
+// Multi-row segment inserts, bounded so statements stay reasonably sized.
+const INSERT_CHUNK = 50;
 
 const attributionSchema = z.object({
   quotes: z.array(
@@ -34,7 +35,19 @@ const attributionSchema = z.object({
   ),
 });
 
-type Attribution = z.infer<typeof attributionSchema>["quotes"][number];
+export type Attribution = z.infer<typeof attributionSchema>["quotes"][number];
+
+// POV detection reads the chapter's opening (and ending, when long enough) —
+// enough to tell first-person or epistolary prose from third-person.
+const POV_HEAD_CHARS = 3_000;
+const POV_TAIL_CHARS = 1_000;
+
+const povSchema = z.object({
+  narrator: z
+    .string()
+    .describe('Narrating character\'s name exactly as listed, or "narrator" for third-person prose'),
+  confidence: z.enum(["high", "medium", "low"]),
+});
 
 interface FinalSegment {
   characterId: string | null; // null = narrator
@@ -44,7 +57,7 @@ interface FinalSegment {
 }
 
 const PERF_CHUNK_CHARS = 14_000;
-const MAX_SFX_PER_CHAPTER = 2;
+export const MAX_SFX_PER_CHAPTER = 2;
 
 const performanceSchema = z.object({
   deliveries: z.array(
@@ -68,29 +81,28 @@ const performanceSchema = z.object({
   ),
 });
 
-interface PerformanceNotes {
-  deliveries: Map<number, Delivery>;
-  sfx: Map<number, { prompt: string; seconds: number }>;
+export interface DeliveryNote {
+  line: number;
+  delivery: Delivery;
+}
+export interface SfxNote {
+  afterLine: number;
+  prompt: string;
+  seconds: number;
 }
 
 /**
- * Turn a chapter into ordered voice-acting segments. Boundaries come from the
- * deterministic quote tokenizer (no words can be lost); the LLM only names
- * each quote's speaker.
+ * Everything scripting needs, re-derived deterministically from the DB —
+ * cleaning and tokenization are pure, so workflow steps can each call this
+ * instead of shipping spans between invocations.
  */
-export async function scriptChapter(
-  chapterId: string,
-  opts: { jobId?: string } = {}
-): Promise<{ segmentCount: number; flagged: number }> {
-  const chapter = db.select().from(chapters).where(eq(chapters.id, chapterId)).get();
+async function loadScriptContext(chapterId: string) {
+  const db = getDb();
+  const [chapter] = await db.select().from(chapters).where(eq(chapters.id, chapterId)).limit(1);
   if (!chapter) throw new Error("Chapter not found");
-  const book = db.select().from(books).where(eq(books.id, chapter.bookId)).get();
+  const [book] = await db.select().from(books).where(eq(books.id, chapter.bookId)).limit(1);
   if (!book) throw new Error("Book not found");
-  const cast = db
-    .select()
-    .from(characters)
-    .where(eq(characters.bookId, chapter.bookId))
-    .all();
+  const cast = await db.select().from(characters).where(eq(characters.bookId, chapter.bookId));
 
   const text = cleanChapterText(chapter.text, chapter.title);
   const { spans } = tokenizeQuotes(text);
@@ -100,68 +112,16 @@ export async function scriptChapter(
     if (s.kind === "quote") quoteSpans.push(i);
   });
 
-  const attributions = new Map<number, Attribution>();
-  let attrChunkCount = 0;
-  if (quoteSpans.length > 0) {
-    const chunks = chunkQuotes(spans, quoteSpans);
-    attrChunkCount = chunks.length;
-    if (opts.jobId) setJobTotal(opts.jobId, chunks.length);
-
-    const nameList =
-      cast
-        .filter((c) => !c.isNarrator)
-        .map((c) => {
-          const aka = c.aliases.length ? ` (aka ${c.aliases.join(", ")})` : "";
-          const variant = c.variantGroup ? ` — ${c.variantGroup} as: ${c.variantLabel}` : "";
-          return `${c.name}${aka}${variant}`;
-        })
-        .join("\n") || '(none listed — use "narrator")';
-    const hasVariants = cast.some((c) => c.variantGroup);
-
-    let recent: string[] = [];
-    for (let ci = 0; ci < chunks.length; ci++) {
-      if (opts.jobId) assertNotCancelled(opts.jobId);
-      const chunk = chunks[ci];
-      const passage = markupPassage(text, spans, quoteSpans, chunk);
-      const { object } = await generateObject({
-        model: getModel("script", book.modelPrefs),
-        schema: attributionSchema,
-        prompt:
-          `You are attributing dialogue for an audiobook of "${book.title}".\n\n` +
-          `In the passage below every quotation is wrapped in ⟦N⟧…⟦/N⟧ markers. ` +
-          `Return one entry for EVERY marker id (${chunk.from}–${chunk.to - 1}).\n\n` +
-          `Characters:\n${nameList}\n\n` +
-          (recent.length
-            ? `Attributions at the end of the previous passage: ${recent.join(", ")}\n\n`
-            : "") +
-          `Rules:\n` +
-          `- speaker is a character name exactly as listed, or "narrator".\n` +
-          `- Use dialogue tags ("said the Mouse") and conversational turn-taking for untagged quotes.\n` +
-          `- Quoted thoughts ("thought Alice") count as dialogue by that character.\n` +
-          `- A sign, label, inscription, letter, or quoted title nobody speaks aloud gets isDialogue=false and speaker "narrator".\n` +
-          (hasVariants
-            ? `- Entries like "Name (child)" / "Name (adult)" are the SAME person at different life stages: attribute each quote to the variant matching the scene's time period, using the exact listed name.\n`
-            : "") +
-          `- If the speaker is unnamed or truly unclear, use "narrator" with confidence "low".\n\n` +
-          `PASSAGE:\n${passage}`,
-      });
-      for (const q of object.quotes) {
-        if (q.id >= chunk.from && q.id < chunk.to && !attributions.has(q.id)) {
-          attributions.set(q.id, q);
-        }
-      }
-      recent = [];
-      for (let q = Math.max(chunk.from, chunk.to - 3); q < chunk.to; q++) {
-        const a = attributions.get(q);
-        if (a) recent.push(`⟦${q}⟧=${a.speaker}`);
-      }
-      if (opts.jobId) {
-        tickJob(opts.jobId, {
-          note: `Identifying speakers ${ci + 1}/${chunks.length} (${chunk.to - chunk.from} quotes)`,
-        });
-      }
-    }
-  }
+  const nameList =
+    cast
+      .filter((c) => !c.isNarrator)
+      .map((c) => {
+        const aka = c.aliases.length ? ` (aka ${c.aliases.join(", ")})` : "";
+        const variant = c.variantGroup ? ` — ${c.variantGroup} as: ${c.variantLabel}` : "";
+        return `${c.name}${aka}${variant}`;
+      })
+      .join("\n") || '(none listed — use "narrator")';
+  const hasVariants = cast.some((c) => c.variantGroup);
 
   // Deterministic resolution: exact names first, then aliases from dominant
   // characters down (first-wins) — so a shared alias like "Hugo" resolves to
@@ -181,84 +141,126 @@ export async function scriptChapter(
     }
   }
 
-  const resolved = assemble(spans, attributions, byName, chapter.title);
-
-  // Voice-director pass: per-line delivery notes + rare sound-effect cues.
-  // Runs before the write transaction, so cancelling leaves the old script intact.
-  const nameById = new Map(cast.map((c) => [c.id, c.name]));
-  const hasDialogue = resolved.some((s) => s.kind === "dialogue");
-  const notes: PerformanceNotes =
-    hasDialogue || book.sfxEnabled
-      ? await performancePass(resolved, nameById, book, chapter.title, text, {
-          ...opts,
-          attrChunkCount,
-        })
-      : { deliveries: new Map(), sfx: new Map() };
-
-  let flagged = 0;
-  let rowCount = 0;
-  db.transaction((tx) => {
-    tx.delete(segments).where(eq(segments.chapterId, chapterId)).run();
-    let idx = 0;
-    resolved.forEach((seg, line) => {
-      if (seg.flagged) flagged++;
-      tx.insert(segments)
-        .values({
-          id: randomUUID(),
-          chapterId,
-          idx: idx++,
-          characterId: seg.characterId,
-          kind: seg.kind,
-          text: seg.text,
-          textHash: createHash("sha256").update(seg.text).digest("hex"),
-          flagged: seg.flagged,
-          delivery: notes.deliveries.get(line) ?? null,
-        })
-        .run();
-      const sfx = notes.sfx.get(line);
-      if (sfx) {
-        tx.insert(segments)
-          .values({
-            id: randomUUID(),
-            chapterId,
-            idx: idx++,
-            characterId: null,
-            kind: "sfx",
-            text: sfx.prompt,
-            textHash: createHash("sha256").update(sfx.prompt).digest("hex"),
-            flagged: false,
-            sfxDurationSec: sfx.seconds,
-          })
-          .run();
-      }
-    });
-    rowCount = idx;
-    tx.update(chapters)
-      .set({ status: "scripted", audioPath: null, durationSec: null, error: null })
-      .where(eq(chapters.id, chapterId))
-      .run();
-  });
-
-  return { segmentCount: rowCount, flagged };
+  return { chapter, book, cast, text, spans, quoteSpans, nameList, hasVariants, byName };
 }
 
 /**
- * One pass over the assembled script asking a "voice director" for sparse
- * delivery notes on dialogue lines and (when enabled) at most a couple of
- * concrete, text-evidenced sound effects. Everything the model returns is
- * re-validated in code — lines out of range, deliveries on narration,
- * unevidenced sounds, and anything past the per-chapter cap are dropped.
+ * Decide who narrates the chapter's prose (one LLM call), and report how many
+ * attribution chunks the chapter needs. First-person or epistolary chapters
+ * are narrated by a character; their narration segments carry that
+ * character's voice instead of the book's.
  */
-async function performancePass(
-  resolved: FinalSegment[],
-  nameById: Map<string, string>,
-  book: typeof books.$inferSelect,
-  chapterTitle: string,
-  cleanedText: string,
-  opts: { jobId?: string; attrChunkCount: number }
-): Promise<PerformanceNotes> {
+export async function detectPovLlm(
+  chapterId: string
+): Promise<{ povCharacterId: string | null; attrChunkCount: number }> {
+  const ctx = await loadScriptContext(chapterId);
+  const { text, book, chapter, nameList, hasVariants, byName } = ctx;
+
+  const head = text.slice(0, POV_HEAD_CHARS);
+  const tail = text.length > POV_HEAD_CHARS + POV_TAIL_CHARS ? text.slice(-POV_TAIL_CHARS) : "";
+  const { object } = await generateObject({
+    model: getModel("script", book.modelPrefs),
+    schema: povSchema,
+    prompt:
+      `You are preparing the audiobook script for "${book.title}".\n\n` +
+      `Decide who narrates the PROSE of the chapter "${chapter.title}" — the voice telling it, ` +
+      `not the characters quoted inside it.\n\n` +
+      `Characters:\n${nameList}\n\n` +
+      `Rules:\n` +
+      `- Third-person or omniscient prose: "narrator".\n` +
+      `- First-person prose, or a letter/diary/message a character writes: that character's name exactly as listed.\n` +
+      (hasVariants
+        ? `- Entries like "Name (child)" / "Name (adult)" are the SAME person at different life stages: pick the variant doing the telling (an adult recounting their childhood narrates as the adult).\n`
+        : "") +
+      `- If truly unclear, use "narrator" with confidence "low".\n\n` +
+      `CHAPTER OPENING:\n${head}` +
+      (tail ? `\n\nCHAPTER ENDING:\n${tail}` : ""),
+  });
+
+  let povCharacterId: string | null = null;
+  if (object.confidence !== "low") {
+    const key = object.narrator.trim().toLowerCase();
+    if (key && key !== "narrator") povCharacterId = byName.get(key) ?? null;
+  }
+  const attrChunkCount =
+    ctx.quoteSpans.length > 0 ? chunkQuotes(ctx.spans, ctx.quoteSpans).length : 0;
+  return { povCharacterId, attrChunkCount };
+}
+
+/** One attribution chunk: name the speaker of every ⟦id⟧-marked quote in it. */
+export async function attributeChunkLlm(
+  chapterId: string,
+  ci: number,
+  recent: string[],
+  povCharacterId: string | null
+): Promise<{ attributions: Attribution[]; recent: string[]; quoteCount: number }> {
+  const ctx = await loadScriptContext(chapterId);
+  const { text, spans, quoteSpans, book, nameList, hasVariants, cast } = ctx;
+  const chunks = chunkQuotes(spans, quoteSpans);
+  const chunk = chunks[ci];
+  if (!chunk) return { attributions: [], recent, quoteCount: 0 };
+  const povName = povCharacterId
+    ? (cast.find((c) => c.id === povCharacterId)?.name ?? null)
+    : null;
+
+  const passage = markupPassage(text, spans, quoteSpans, chunk);
+  const { object } = await generateObject({
+    model: getModel("script", book.modelPrefs),
+    schema: attributionSchema,
+    prompt:
+      `You are attributing dialogue for an audiobook of "${book.title}".\n\n` +
+      `In the passage below every quotation is wrapped in ⟦N⟧…⟦/N⟧ markers. ` +
+      `Return one entry for EVERY marker id (${chunk.from}–${chunk.to - 1}).\n\n` +
+      `Characters:\n${nameList}\n\n` +
+      (recent.length
+        ? `Attributions at the end of the previous passage: ${recent.join(", ")}\n\n`
+        : "") +
+      `Rules:\n` +
+      `- speaker is a character name exactly as listed, or "narrator".\n` +
+      `- Use dialogue tags ("said the Mouse") and conversational turn-taking for untagged quotes.\n` +
+      `- Quoted thoughts ("thought Alice") count as dialogue by that character.\n` +
+      `- A sign, label, inscription, letter, or quoted title nobody speaks aloud gets isDialogue=false and speaker "narrator".\n` +
+      (hasVariants
+        ? `- Entries like "Name (child)" / "Name (adult)" are the SAME person at different life stages: attribute each quote to the variant matching the scene's time period, using the exact listed name.\n`
+        : "") +
+      (povName
+        ? `- This chapter's prose is narrated first-person by ${povName}: quotes the narrator speaks or thinks ("I said…") belong to ${povName}.\n`
+        : "") +
+      `- If the speaker is unnamed or truly unclear, use "narrator" with confidence "low".\n\n` +
+      `PASSAGE:\n${passage}`,
+  });
+
+  const inRange = object.quotes.filter((q) => q.id >= chunk.from && q.id < chunk.to);
+  // Rolling context for the next chunk: the last few attributions of this one
+  const byId = new Map(inRange.map((q) => [q.id, q]));
+  const nextRecent: string[] = [];
+  for (let q = Math.max(chunk.from, chunk.to - 3); q < chunk.to; q++) {
+    const a = byId.get(q);
+    if (a) nextRecent.push(`⟦${q}⟧=${a.speaker}`);
+  }
+  return { attributions: inRange, recent: nextRecent, quoteCount: chunk.to - chunk.from };
+}
+
+/** Derived inputs shared by the performance-pass planning and chunk calls. */
+async function buildPerformanceContext(
+  chapterId: string,
+  attributionList: Attribution[],
+  povCharacterId: string | null
+) {
+  const ctx = await loadScriptContext(chapterId);
+  const attributions = new Map<number, Attribution>();
+  for (const a of attributionList) {
+    if (!attributions.has(a.id)) attributions.set(a.id, a);
+  }
+  const resolved = assemble(ctx.spans, attributions, ctx.byName, ctx.chapter.title, povCharacterId);
+  const nameById = new Map(ctx.cast.map((c) => [c.id, c.name]));
   const lines = resolved.map((seg, i) => {
-    const label = seg.characterId ? (nameById.get(seg.characterId) ?? "?") : "Narration";
+    // Keyed on kind, not characterId — POV-narrated narration still reads
+    // [Narration] so the voice director never marks delivery on it.
+    const label =
+      seg.kind === "dialogue" && seg.characterId
+        ? (nameById.get(seg.characterId) ?? "?")
+        : "Narration";
     return `#${i} [${label}]: ${seg.text}`;
   });
 
@@ -276,7 +278,38 @@ async function performancePass(
   }
   chunks.push({ from, to: lines.length });
 
-  if (opts.jobId) setJobTotal(opts.jobId, opts.attrChunkCount + chunks.length);
+  return { ...ctx, resolved, lines, chunks };
+}
+
+/** How many performance-pass chunks the chapter needs (0 = skip the pass). */
+export async function performancePlan(
+  chapterId: string,
+  attributionList: Attribution[],
+  povCharacterId: string | null
+): Promise<{ chunkCount: number }> {
+  const ctx = await buildPerformanceContext(chapterId, attributionList, povCharacterId);
+  const hasDialogue = ctx.resolved.some((s) => s.kind === "dialogue");
+  if (!hasDialogue && !ctx.book.sfxEnabled) return { chunkCount: 0 };
+  return { chunkCount: ctx.chunks.length };
+}
+
+/**
+ * One voice-director chunk: sparse delivery notes on dialogue lines and (when
+ * enabled) rare, text-evidenced sound effects. Everything the model returns
+ * is re-validated in code — lines out of range, deliveries on narration,
+ * unevidenced sounds are dropped (the per-chapter sfx cap is enforced by the
+ * caller when merging chunks).
+ */
+export async function performanceChunkLlm(
+  chapterId: string,
+  attributionList: Attribution[],
+  povCharacterId: string | null,
+  ci: number
+): Promise<{ deliveries: DeliveryNote[]; sfx: SfxNote[] }> {
+  const ctx = await buildPerformanceContext(chapterId, attributionList, povCharacterId);
+  const { book, chapter, lines, chunks, resolved, text } = ctx;
+  const chunk = chunks[ci];
+  if (!chunk) return { deliveries: [], sfx: [] };
 
   const sfxJob = book.sfxEnabled
     ? `2. SOUND EFFECTS — almost always NONE. You may insert a sound effect after a\n` +
@@ -293,64 +326,120 @@ async function performancePass(
       `     more than one for this excerpt.`
     : `2. SOUND EFFECTS — disabled for this book. Return soundEffects as an empty array.`;
 
-  const deliveries = new Map<number, Delivery>();
-  const sfx = new Map<number, { prompt: string; seconds: number }>();
+  const { object } = await generateObject({
+    model: getModel("script", book.modelPrefs),
+    schema: performanceSchema,
+    prompt:
+      `You are the voice director for the audiobook of "${book.title}".\n\n` +
+      `Below is part of the final numbered script for "${chapter.title}". Dialogue ` +
+      `lines show their speaker; narration lines are marked [Narration].\n\n` +
+      `Two jobs:\n\n` +
+      `1. DELIVERY NOTES — for DIALOGUE lines only. Mark a line ONLY when the text\n` +
+      `   makes the delivery unmistakable: an explicit tag ("she whispered", "he\n` +
+      `   roared"), or an unambiguous situation (screaming for help, sobbing while\n` +
+      `   speaking). A good narrator reads most lines with no note — mark at most 1\n` +
+      `   line in 6, and prefer fewer. Never mark [Narration] lines.\n` +
+      `   Allowed values: ${DELIVERY_VALUES.join(", ")}.\n\n` +
+      `${sfxJob}\n\n` +
+      `Return empty arrays when nothing qualifies.\n\n` +
+      `SCRIPT:\n${lines.slice(chunk.from, chunk.to).join("\n")}`,
+  });
 
-  for (let ci = 0; ci < chunks.length; ci++) {
-    if (opts.jobId) assertNotCancelled(opts.jobId);
-    const chunk = chunks[ci];
-    const { object } = await generateObject({
-      model: getModel("script", book.modelPrefs),
-      schema: performanceSchema,
-      prompt:
-        `You are the voice director for the audiobook of "${book.title}".\n\n` +
-        `Below is part of the final numbered script for "${chapterTitle}". Dialogue ` +
-        `lines show their speaker; narration lines are marked [Narration].\n\n` +
-        `Two jobs:\n\n` +
-        `1. DELIVERY NOTES — for DIALOGUE lines only. Mark a line ONLY when the text\n` +
-        `   makes the delivery unmistakable: an explicit tag ("she whispered", "he\n` +
-        `   roared"), or an unambiguous situation (screaming for help, sobbing while\n` +
-        `   speaking). A good narrator reads most lines with no note — mark at most 1\n` +
-        `   line in 6, and prefer fewer. Never mark [Narration] lines.\n` +
-        `   Allowed values: ${DELIVERY_VALUES.join(", ")}.\n\n` +
-        `${sfxJob}\n\n` +
-        `Return empty arrays when nothing qualifies.\n\n` +
-        `SCRIPT:\n${lines.slice(chunk.from, chunk.to).join("\n")}`,
-    });
-
-    for (const d of object.deliveries) {
-      const seg = resolved[d.line];
-      if (
-        d.line >= chunk.from &&
-        d.line < chunk.to &&
-        seg?.kind === "dialogue" &&
-        !deliveries.has(d.line)
-      ) {
-        deliveries.set(d.line, d.delivery);
-      }
-    }
-    if (book.sfxEnabled) {
-      for (const s of object.soundEffects) {
-        if (sfx.size >= MAX_SFX_PER_CHAPTER) break;
-        const evidenced = s.evidence.trim().length > 0 && cleanedText.includes(s.evidence.trim());
-        if (
-          s.afterLine >= chunk.from &&
-          s.afterLine < chunk.to &&
-          evidenced &&
-          s.prompt.trim() &&
-          !sfx.has(s.afterLine)
-        ) {
-          const seconds = Math.round(Math.min(6, Math.max(1, s.seconds)) * 10) / 10;
-          sfx.set(s.afterLine, { prompt: s.prompt.trim(), seconds });
-        }
-      }
-    }
-    if (opts.jobId) {
-      tickJob(opts.jobId, { note: `Performance notes ${ci + 1}/${chunks.length}` });
+  const deliveries: DeliveryNote[] = [];
+  for (const d of object.deliveries) {
+    const seg = resolved[d.line];
+    if (d.line >= chunk.from && d.line < chunk.to && seg?.kind === "dialogue") {
+      deliveries.push({ line: d.line, delivery: d.delivery });
     }
   }
-
+  const sfx: SfxNote[] = [];
+  if (book.sfxEnabled) {
+    for (const s of object.soundEffects) {
+      const evidenced = s.evidence.trim().length > 0 && text.includes(s.evidence.trim());
+      if (s.afterLine >= chunk.from && s.afterLine < chunk.to && evidenced && s.prompt.trim()) {
+        const seconds = Math.round(Math.min(6, Math.max(1, s.seconds)) * 10) / 10;
+        sfx.push({ afterLine: s.afterLine, prompt: s.prompt.trim(), seconds });
+      }
+    }
+  }
   return { deliveries, sfx };
+}
+
+/**
+ * Assemble the final segment rows and replace the chapter's script in one
+ * transaction. Boundaries come from the deterministic quote tokenizer (no
+ * words can be lost); the LLM only named each quote's speaker.
+ */
+export async function writeScript(
+  chapterId: string,
+  attributionList: Attribution[],
+  deliveryNotes: DeliveryNote[],
+  sfxNotes: SfxNote[],
+  povCharacterId: string | null
+): Promise<{ segmentCount: number; flagged: number }> {
+  const ctx = await loadScriptContext(chapterId);
+  const attributions = new Map<number, Attribution>();
+  for (const a of attributionList) {
+    if (!attributions.has(a.id)) attributions.set(a.id, a);
+  }
+  const resolved = assemble(ctx.spans, attributions, ctx.byName, ctx.chapter.title, povCharacterId);
+
+  const deliveries = new Map<number, Delivery>();
+  for (const d of deliveryNotes) {
+    if (!deliveries.has(d.line)) deliveries.set(d.line, d.delivery);
+  }
+  const sfx = new Map<number, { prompt: string; seconds: number }>();
+  for (const s of sfxNotes) {
+    if (sfx.size >= MAX_SFX_PER_CHAPTER) break;
+    if (!sfx.has(s.afterLine)) sfx.set(s.afterLine, { prompt: s.prompt, seconds: s.seconds });
+  }
+
+  // Build the full row set outside the transaction (pure computation).
+  let flagged = 0;
+  type SegmentRow = typeof segments.$inferInsert;
+  const rows: SegmentRow[] = [];
+  resolved.forEach((seg, line) => {
+    if (seg.flagged) flagged++;
+    rows.push({
+      id: randomUUID(),
+      chapterId,
+      idx: rows.length,
+      characterId: seg.characterId,
+      kind: seg.kind,
+      text: seg.text,
+      textHash: createHash("sha256").update(seg.text).digest("hex"),
+      flagged: seg.flagged,
+      delivery: deliveries.get(line) ?? null,
+    });
+    const cue = sfx.get(line);
+    if (cue) {
+      rows.push({
+        id: randomUUID(),
+        chapterId,
+        idx: rows.length,
+        characterId: null,
+        kind: "sfx",
+        text: cue.prompt,
+        textHash: createHash("sha256").update(cue.prompt).digest("hex"),
+        flagged: false,
+        sfxDurationSec: cue.seconds,
+      });
+    }
+  });
+
+  const db = getDb();
+  await db.transaction(async (tx) => {
+    await tx.delete(segments).where(eq(segments.chapterId, chapterId));
+    for (let i = 0; i < rows.length; i += INSERT_CHUNK) {
+      await tx.insert(segments).values(rows.slice(i, i + INSERT_CHUNK));
+    }
+    await tx
+      .update(chapters)
+      .set({ status: "scripted", audioPath: null, durationSec: null, error: null })
+      .where(eq(chapters.id, chapterId));
+  });
+
+  return { segmentCount: rows.length, flagged };
 }
 
 /** Group consecutive quotes into attribution calls bounded by count and span. */
@@ -399,13 +488,17 @@ function markupPassage(
  * Walk the spans into final segments: narration (and non-spoken quotes) flow
  * into a buffer split at ~NARRATION_SPLIT on paragraph boundaries; spoken
  * quotes become dialogue segments (kept separate even when narrator-voiced so
- * they stay individually reassignable in the script viewer).
+ * they stay individually reassignable in the script viewer). In a POV chapter
+ * the narrating character voices the narration — and any quote that didn't
+ * resolve to a listed character — while the title announcement stays with the
+ * book's narrator.
  */
 function assemble(
   spans: TextSpan[],
   attributions: Map<number, Attribution>,
   byName: Map<string, string>,
-  title: string
+  title: string,
+  povCharacterId: string | null
 ): FinalSegment[] {
   const out: FinalSegment[] = [];
   const announce = titleAnnouncement(title);
@@ -419,7 +512,12 @@ function assemble(
     const trimmed = buffer.trim();
     if (trimmed) {
       for (const piece of splitNarration(trimmed)) {
-        out.push({ characterId: null, kind: "narration", text: piece, flagged: bufferFlagged });
+        out.push({
+          characterId: povCharacterId,
+          kind: "narration",
+          text: piece,
+          flagged: bufferFlagged,
+        });
       }
     }
     buffer = "";
@@ -448,6 +546,9 @@ function assemble(
       characterId = byName.get(att.speaker.toLowerCase()) ?? null;
       if (!characterId) flagged = true; // unknown speaker name — review
     }
+    // In a POV chapter every unattributed line is still the narrating
+    // character's telling, so it keeps their voice.
+    characterId ??= povCharacterId;
 
     const gap = buffer;
     if (gap.trim()) {

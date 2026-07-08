@@ -1,17 +1,13 @@
-import { after } from "next/server";
 import { eq } from "drizzle-orm";
-import { db, books, chapters, characters, voiceAssignments } from "@/lib/db";
+import { start } from "workflow/api";
+import { getDb, books, chapters, characters, voiceAssignments } from "@/lib/db";
 import type { PipelineStage } from "@/lib/db/schema";
 import { errorResponse, AppError, requireEnv } from "@/lib/errors";
-import { createJob } from "@/lib/jobs";
-import {
-  generateSample,
-  pickSampleChapter,
-  runAnalysisStage,
-  runCastingJob,
-  runSampleStage,
-  sampleHasScript,
-} from "@/lib/pipeline";
+import { attachRunId, createJob } from "@/lib/jobs";
+import { pickSampleChapter, sampleHasScript } from "@/lib/pipeline";
+import { analyzeWorkflow } from "@/workflows/analyze";
+import { castWorkflow } from "@/workflows/cast";
+import { sampleGenerateWorkflow, sampleStageWorkflow } from "@/workflows/sample";
 
 type Action = "start" | "approve_cast" | "approve_voices" | "dismiss" | "retry";
 
@@ -19,7 +15,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
   try {
     const { id } = await params;
     const { action } = (await req.json().catch(() => ({}))) as { action?: Action };
-    const book = db.select().from(books).where(eq(books.id, id)).get();
+    const db = getDb();
+    const [book] = await db.select().from(books).where(eq(books.id, id)).limit(1);
     if (!book) throw new AppError("Book not found", "not_found", 404);
 
     switch (action) {
@@ -28,26 +25,26 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         if (book.pipelineStage) {
           throw new AppError("Guided setup is already running", "wrong_stage", 409);
         }
-        return Response.json(startOrSkipAhead(id, book.status));
+        return Response.json(await startOrSkipAhead(id, book.status));
       }
 
       case "approve_cast": {
         requireEnv("ANTHROPIC_API_KEY");
         requireEnv("ELEVENLABS_API_KEY");
         expectStage(book.pipelineStage, "cast_review");
-        return Response.json(dispatchCasting(id));
+        return Response.json(await dispatchCasting(id));
       }
 
       case "approve_voices": {
         requireEnv("ANTHROPIC_API_KEY");
         requireEnv("ELEVENLABS_API_KEY");
         expectStage(book.pipelineStage, "voice_review");
-        requireAllVoicesAssigned(id);
-        return Response.json(dispatchSample(id, { skipScriptIfPresent: false }));
+        await requireAllVoicesAssigned(id);
+        return Response.json(await dispatchSample(id, { skipScriptIfPresent: false }));
       }
 
       case "dismiss": {
-        db.update(books).set({ pipelineStage: null }).where(eq(books.id, id)).run();
+        await db.update(books).set({ pipelineStage: null }).where(eq(books.id, id));
         return Response.json({ pipelineStage: null });
       }
 
@@ -56,12 +53,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           case "analyzing": {
             requireEnv("ANTHROPIC_API_KEY");
             if (book.status === "analyzing") throw new AppError("Analysis is running", "busy", 409);
-            const jobId = createJob("analyze", id);
-            db.update(books)
-              .set({ status: "analyzing", error: null })
-              .where(eq(books.id, id))
-              .run();
-            after(() => runAnalysisStage(id, jobId));
+            const jobId = await createJob("analyze", id);
+            await db.update(books).set({ status: "analyzing", error: null }).where(eq(books.id, id));
+            const run = await start(analyzeWorkflow, [id, jobId]);
+            await attachRunId(jobId, run.runId);
             return Response.json({ pipelineStage: "analyzing", jobId });
           }
           case "casting": {
@@ -70,13 +65,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             if (book.status === "casting" && !book.error) {
               throw new AppError("Casting is running", "busy", 409);
             }
-            return Response.json(dispatchCasting(id));
+            return Response.json(await dispatchCasting(id));
           }
           case "scripting_sample":
           case "generating_sample": {
             requireEnv("ANTHROPIC_API_KEY");
             requireEnv("ELEVENLABS_API_KEY");
-            return Response.json(dispatchSample(id, { skipScriptIfPresent: true }));
+            return Response.json(await dispatchSample(id, { skipScriptIfPresent: true }));
           }
           default:
             // Review gates and sample_ready have nothing to retry
@@ -103,48 +98,50 @@ function expectStage(current: PipelineStage | null, expected: PipelineStage): vo
 }
 
 /** start: skip ahead past steps that are already done. */
-function startOrSkipAhead(bookId: string, bookStatus: string) {
-  const cast = db
+async function startOrSkipAhead(bookId: string, bookStatus: string) {
+  const db = getDb();
+  const cast = await db
     .select({ id: characters.id, assignmentId: voiceAssignments.id })
     .from(characters)
     .leftJoin(voiceAssignments, eq(voiceAssignments.characterId, characters.id))
-    .where(eq(characters.bookId, bookId))
-    .all();
+    .where(eq(characters.bookId, bookId));
 
   if (cast.length === 0) {
     if (bookStatus === "analyzing") throw new AppError("Analysis is running", "busy", 409);
-    const jobId = createJob("analyze", bookId);
-    db.update(books)
+    const jobId = await createJob("analyze", bookId);
+    await db
+      .update(books)
       .set({ status: "analyzing", error: null, pipelineStage: "analyzing" })
-      .where(eq(books.id, bookId))
-      .run();
-    after(() => runAnalysisStage(bookId, jobId));
+      .where(eq(books.id, bookId));
+    const run = await start(analyzeWorkflow, [bookId, jobId]);
+    await attachRunId(jobId, run.runId);
     return { pipelineStage: "analyzing", jobId };
   }
 
   const stage = cast.every((c) => c.assignmentId) ? "voice_review" : "cast_review";
-  db.update(books).set({ pipelineStage: stage }).where(eq(books.id, bookId)).run();
+  await db.update(books).set({ pipelineStage: stage }).where(eq(books.id, bookId));
   return { pipelineStage: stage };
 }
 
-function dispatchCasting(bookId: string) {
-  const jobId = createJob("cast", bookId);
-  db.update(books)
+async function dispatchCasting(bookId: string) {
+  const jobId = await createJob("cast", bookId);
+  await getDb()
+    .update(books)
     .set({ status: "casting", error: null, pipelineStage: "casting" })
-    .where(eq(books.id, bookId))
-    .run();
-  after(() => runCastingJob(bookId, jobId));
+    .where(eq(books.id, bookId));
+  const run = await start(castWorkflow, [bookId, jobId]);
+  await attachRunId(jobId, run.runId);
   return { pipelineStage: "casting", jobId };
 }
 
-function requireAllVoicesAssigned(bookId: string): void {
-  const missing = db
-    .select({ name: characters.name, assignmentId: voiceAssignments.id })
-    .from(characters)
-    .leftJoin(voiceAssignments, eq(voiceAssignments.characterId, characters.id))
-    .where(eq(characters.bookId, bookId))
-    .all()
-    .filter((c) => !c.assignmentId);
+async function requireAllVoicesAssigned(bookId: string): Promise<void> {
+  const missing = (
+    await getDb()
+      .select({ name: characters.name, assignmentId: voiceAssignments.id })
+      .from(characters)
+      .leftJoin(voiceAssignments, eq(voiceAssignments.characterId, characters.id))
+      .where(eq(characters.bookId, bookId))
+  ).filter((c) => !c.assignmentId);
   if (missing.length > 0) {
     throw new AppError(
       `No voice assigned for: ${missing.map((m) => m.name).join(", ")}`,
@@ -153,31 +150,33 @@ function requireAllVoicesAssigned(bookId: string): void {
   }
 }
 
-function dispatchSample(bookId: string, { skipScriptIfPresent }: { skipScriptIfPresent: boolean }) {
-  const sample = pickSampleChapter(bookId);
+async function dispatchSample(bookId: string, { skipScriptIfPresent }: { skipScriptIfPresent: boolean }) {
+  const db = getDb();
+  const sample = await pickSampleChapter(bookId);
   if (!sample) throw new AppError("Book has no chapters", "no_chapters");
   if (sample.status === "scripting" || sample.status === "generating") {
     throw new AppError("Sample chapter is busy", "busy", 409);
   }
 
-  if (skipScriptIfPresent && sample.status !== "error" && sampleHasScript(sample.id)) {
-    db.update(books)
+  if (skipScriptIfPresent && sample.status !== "error" && (await sampleHasScript(sample.id))) {
+    await db
+      .update(books)
       .set({ pipelineStage: "generating_sample" })
-      .where(eq(books.id, bookId))
-      .run();
-    after(() => generateSample(bookId, sample.id));
+      .where(eq(books.id, bookId));
+    await start(sampleGenerateWorkflow, [bookId, sample.id]);
     return { pipelineStage: "generating_sample" };
   }
 
-  const jobId = createJob("script", bookId, sample.id);
-  db.update(chapters)
+  const jobId = await createJob("script", bookId, sample.id);
+  await db
+    .update(chapters)
     .set({ status: "scripting", error: null })
-    .where(eq(chapters.id, sample.id))
-    .run();
-  db.update(books)
+    .where(eq(chapters.id, sample.id));
+  await db
+    .update(books)
     .set({ pipelineStage: "scripting_sample" })
-    .where(eq(books.id, bookId))
-    .run();
-  after(() => runSampleStage(bookId, sample.id, jobId));
+    .where(eq(books.id, bookId));
+  const run = await start(sampleStageWorkflow, [bookId, sample.id, jobId]);
+  await attachRunId(jobId, run.runId);
   return { pipelineStage: "scripting_sample", jobId };
 }

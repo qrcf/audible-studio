@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { db, characters } from "@/lib/db";
+import { getDb, characters } from "@/lib/db";
 import { errorResponse, AppError } from "@/lib/errors";
 
 interface VariantInput {
@@ -16,7 +16,8 @@ interface VariantInput {
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     const { id } = await params;
-    const character = db.select().from(characters).where(eq(characters.id, id)).get();
+    const db = getDb();
+    const [character] = await db.select().from(characters).where(eq(characters.id, id)).limit(1);
     if (!character) throw new AppError("Character not found", "not_found", 404);
     if (character.isNarrator) throw new AppError("The narrator can't be split", "not_splittable");
     if (character.variantGroup) {
@@ -49,10 +50,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     };
 
     const created: { id: string; name: string }[] = [];
-    db.transaction((tx) => {
+    await db.transaction(async (tx) => {
       const [first, ...rest] = variants;
       const firstName = `${base} (${first.label})`;
-      tx.update(characters)
+      await tx
+        .update(characters)
         .set({
           name: firstName,
           variantGroup: base,
@@ -60,30 +62,28 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           aliases: withBaseAlias(firstName),
           profile: { ...character.profile, ageRange: first.ageRange || character.profile.ageRange },
         })
-        .where(eq(characters.id, id))
-        .run();
+        .where(eq(characters.id, id));
       created.push({ id, name: firstName });
 
-      for (const v of rest) {
+      const siblings = rest.map((v) => {
         const newId = randomUUID();
         const name = `${base} (${v.label})`;
-        tx.insert(characters)
-          .values({
-            id: newId,
-            bookId: character.bookId,
-            name,
-            aliases: withBaseAlias(name),
-            role: character.role,
-            profile: { ...character.profile, ageRange: v.ageRange || character.profile.ageRange },
-            quotes: [],
-            dialogueShare: 0,
-            isNarrator: false,
-            variantGroup: base,
-            variantLabel: v.label,
-          })
-          .run();
         created.push({ id: newId, name });
-      }
+        return {
+          id: newId,
+          bookId: character.bookId,
+          name,
+          aliases: withBaseAlias(name),
+          role: character.role,
+          profile: { ...character.profile, ageRange: v.ageRange || character.profile.ageRange },
+          quotes: [],
+          dialogueShare: 0,
+          isNarrator: false,
+          variantGroup: base,
+          variantLabel: v.label,
+        };
+      });
+      await tx.insert(characters).values(siblings);
     });
 
     return Response.json({ ok: true, characters: created });

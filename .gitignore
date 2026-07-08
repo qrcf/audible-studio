@@ -42,3 +42,7 @@ next-env.d.ts
 
 # App data (SQLite DB + generated audio)
 /data
+
+# Workflow DevKit local run state
+.workflow-data/
+/.swc

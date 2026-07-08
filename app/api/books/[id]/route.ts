@@ -1,8 +1,8 @@
 import { eq } from "drizzle-orm";
-import { db, books, chapters, characters } from "@/lib/db";
+import { getDb, books, chapters, characters } from "@/lib/db";
 import { errorResponse, AppError } from "@/lib/errors";
 import { isLlmModelId, type LlmStep, type ModelPrefs } from "@/lib/llm-models";
-import { deleteBookAudio } from "@/lib/paths";
+import { deleteBookAudio } from "@/lib/storage";
 
 const LLM_STEP_KEYS: LlmStep[] = ["analyze", "cast", "script"];
 
@@ -27,9 +27,10 @@ type Ctx = { params: Promise<{ id: string }> };
 
 export async function GET(_req: Request, { params }: Ctx) {
   const { id } = await params;
-  const book = db.select().from(books).where(eq(books.id, id)).get();
+  const db = getDb();
+  const [book] = await db.select().from(books).where(eq(books.id, id)).limit(1);
   if (!book) return Response.json({ error: "Not found" }, { status: 404 });
-  const bookChapters = db
+  const bookChapters = await db
     .select({
       id: chapters.id,
       idx: chapters.idx,
@@ -38,9 +39,8 @@ export async function GET(_req: Request, { params }: Ctx) {
       status: chapters.status,
     })
     .from(chapters)
-    .where(eq(chapters.bookId, id))
-    .all();
-  const cast = db.select().from(characters).where(eq(characters.bookId, id)).all();
+    .where(eq(chapters.bookId, id));
+  const cast = await db.select().from(characters).where(eq(characters.bookId, id));
   return Response.json({ ...book, chapters: bookChapters, characters: cast });
 }
 
@@ -73,7 +73,7 @@ export async function PATCH(req: Request, { params }: Ctx) {
     }
     if (body.modelPrefs !== undefined) patch.modelPrefs = parseModelPrefs(body.modelPrefs);
     if (body.title) patch.title = body.title;
-    db.update(books).set(patch).where(eq(books.id, id)).run();
+    await getDb().update(books).set(patch).where(eq(books.id, id));
     return Response.json({ ok: true });
   } catch (err) {
     return errorResponse(err);
@@ -83,8 +83,8 @@ export async function PATCH(req: Request, { params }: Ctx) {
 export async function DELETE(_req: Request, { params }: Ctx) {
   try {
     const { id } = await params;
-    db.delete(books).where(eq(books.id, id)).run();
-    deleteBookAudio(id);
+    await getDb().delete(books).where(eq(books.id, id));
+    await deleteBookAudio(id);
     return Response.json({ ok: true });
   } catch (err) {
     return errorResponse(err);

@@ -1,5 +1,5 @@
 import { and, eq, ne } from "drizzle-orm";
-import { db, characters, segments } from "@/lib/db";
+import { getDb, characters, segments } from "@/lib/db";
 import type { CharacterProfile } from "@/lib/db/schema";
 import { errorResponse, AppError } from "@/lib/errors";
 import { markStaleForCharacter } from "@/lib/generation";
@@ -21,7 +21,8 @@ const GENDERS = ["male", "female", "nonbinary", "unknown"];
 export async function PATCH(req: Request, { params }: Ctx) {
   try {
     const { id } = await params;
-    const character = db.select().from(characters).where(eq(characters.id, id)).get();
+    const db = getDb();
+    const [character] = await db.select().from(characters).where(eq(characters.id, id)).limit(1);
     if (!character) throw new AppError("Character not found", "not_found", 404);
 
     const body = (await req.json()) as { profile?: Record<string, unknown> };
@@ -46,10 +47,9 @@ export async function PATCH(req: Request, { params }: Ctx) {
     }
 
     const profile = { ...character.profile, ...patch };
-    db.update(characters)
+    await db.update(characters)
       .set({ profile, profileEdited: true })
-      .where(eq(characters.id, id))
-      .run();
+      .where(eq(characters.id, id));
     return Response.json({ ok: true, profile });
   } catch (err) {
     return errorResponse(err);
@@ -64,25 +64,26 @@ export async function PATCH(req: Request, { params }: Ctx) {
 export async function DELETE(req: Request, { params }: Ctx) {
   try {
     const { id } = await params;
-    const character = db.select().from(characters).where(eq(characters.id, id)).get();
+    const db = getDb();
+    const [character] = await db.select().from(characters).where(eq(characters.id, id)).limit(1);
     if (!character) throw new AppError("Character not found", "not_found", 404);
     if (character.isNarrator || !character.variantGroup || !character.variantLabel) {
       throw new AppError("Only age variants can be removed", "not_a_variant");
     }
 
     const body = (await req.json().catch(() => ({}))) as { reassignTo?: string };
-    const siblings = db
-      .select()
-      .from(characters)
-      .where(
-        and(
-          eq(characters.bookId, character.bookId),
-          eq(characters.variantGroup, character.variantGroup),
-          ne(characters.id, id)
+    const siblings = (
+      await db
+        .select()
+        .from(characters)
+        .where(
+          and(
+            eq(characters.bookId, character.bookId),
+            eq(characters.variantGroup, character.variantGroup),
+            ne(characters.id, id)
+          )
         )
-      )
-      .all()
-      .sort((a, b) => b.dialogueShare - a.dialogueShare);
+    ).sort((a, b) => b.dialogueShare - a.dialogueShare);
     if (siblings.length === 0) {
       throw new AppError("No sibling variant to reassign lines to", "no_sibling");
     }
@@ -94,27 +95,27 @@ export async function DELETE(req: Request, { params }: Ctx) {
     }
 
     // Before the segments move: mark chapters that contain this voice stale
-    const staleChapters = markStaleForCharacter(id, character.bookId, false);
+    const staleChapters = await markStaleForCharacter(id, character.bookId, false);
 
     let collapsed = false;
-    db.transaction((tx) => {
-      tx.update(segments)
+    await db.transaction(async (tx) => {
+      await tx
+        .update(segments)
         .set({ characterId: target.id, audioPath: null })
-        .where(eq(segments.characterId, id))
-        .run();
-      tx.delete(characters).where(eq(characters.id, id)).run();
+        .where(eq(segments.characterId, id));
+      await tx.delete(characters).where(eq(characters.id, id));
       if (siblings.length === 1) {
         // Last sibling standing becomes the plain character again
         const base = character.variantGroup!;
-        tx.update(characters)
+        await tx
+          .update(characters)
           .set({
             name: base,
             variantGroup: null,
             variantLabel: null,
             aliases: target.aliases.filter((a) => a.trim().toLowerCase() !== base.toLowerCase()),
           })
-          .where(eq(characters.id, target.id))
-          .run();
+          .where(eq(characters.id, target.id));
         collapsed = true;
       }
     });

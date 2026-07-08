@@ -1,6 +1,6 @@
 import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
 import { eq } from "drizzle-orm";
-import { db, voiceCatalogSnapshots } from "@/lib/db";
+import { getDb, voiceCatalogSnapshots } from "@/lib/db";
 import { requireEnv } from "@/lib/errors";
 
 export interface VoiceProfile {
@@ -37,11 +37,11 @@ export async function getVoiceCatalog(force = false): Promise<VoiceProfile[]> {
   }
 
   if (!force) {
-    const snapshot = db
+    const [snapshot] = await getDb()
       .select()
       .from(voiceCatalogSnapshots)
       .where(eq(voiceCatalogSnapshots.id, "latest"))
-      .get();
+      .limit(1);
     if (snapshot) {
       const age = Date.now() - snapshot.fetchedAt.getTime();
       if (age < SNAPSHOT_MAX_AGE_MS) {
@@ -76,13 +76,13 @@ async function fetchCatalog(): Promise<VoiceProfile[]> {
   const voices = raw.map(normalizeVoice);
   globalForCatalog.__voiceCatalog = { voices, fetchedAt: Date.now() };
 
-  db.insert(voiceCatalogSnapshots)
+  await getDb()
+    .insert(voiceCatalogSnapshots)
     .values({ id: "latest", payload: voices, fetchedAt: new Date() })
     .onConflictDoUpdate({
       target: voiceCatalogSnapshots.id,
       set: { payload: voices, fetchedAt: new Date() },
-    })
-    .run();
+    });
 
   return voices;
 }

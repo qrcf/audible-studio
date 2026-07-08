@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   BookOpenText,
   Download,
@@ -25,10 +25,31 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { formatDuration } from "@/lib/format";
 import { speakerColor } from "./speaker-colors";
 import type { BookData, ChapterMeta } from "./types";
+
+function saveBlob(blob: Blob, filename: string) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// The download attribute is ignored after the audio route's cross-origin
+// redirect, so downloads fetch the bytes and save them with a proper name.
+async function saveAudio(audioPath: string, filename: string) {
+  const res = await fetch(`/api/audio/${audioPath}`);
+  if (!res.ok) throw new Error("Download failed");
+  saveBlob(await res.blob(), filename);
+}
+
+function safeName(title: string, fallback: string): string {
+  return title.replace(/[^\w\s-]/g, "").trim().slice(0, 80) || fallback;
+}
 
 interface TimedPhrase {
   text: string;
@@ -45,8 +66,23 @@ interface ReadalongSegment {
   text: string;
   startSec: number;
   durationSec: number;
+  paraBreakBefore: boolean;
+  spaceBefore: boolean;
+  isTitle?: boolean;
   phrases: TimedPhrase[];
 }
+
+// Book-page render model: timed phrase fragments regrouped into paragraphs
+interface ReaderPiece {
+  segIdx: number;
+  phraseIdx: number;
+  text: string;
+  label?: string; // speaker name, shown once when the dialogue speaker changes
+}
+type ReaderBlock =
+  | { kind: "title"; segIdx: number; text: string }
+  | { kind: "sfx"; segIdx: number }
+  | { kind: "para"; pieces: ReaderPiece[] };
 
 interface ReadalongScript {
   chapterId: string;
@@ -64,9 +100,15 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [rate, setRate] = useState("1");
-  const [readAlong, setReadAlong] = useState(false);
+  const [readAlong, setReadAlong] = useState(true);
+  const [zipping, setZipping] = useState(false);
   const [script, setScript] = useState<ReadalongScript | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const autoScrollRef = useRef<{ active: boolean; timer: ReturnType<typeof setTimeout> | null }>({
+    active: false,
+    timer: null,
+  });
+  const userScrolledAtRef = useRef(0);
 
   const play = useCallback(
     (chapter: ChapterMeta) => {
@@ -166,21 +208,104 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
     }
   }
 
-  // Keep the active line centered in the transcript panel
+  // Regroup the flat segment→phrase list into book-page blocks: paragraphs of
+  // flowing prose (narration + dialogue), with title/sfx as their own blocks.
+  // A phrase can carry internal blank lines, so each phrase is split on
+  // paragraph breaks and its later chunks open fresh paragraphs.
+  const blocks = useMemo<ReaderBlock[]>(() => {
+    if (!activeSegments) return [];
+    const out: ReaderBlock[] = [];
+    let para: ReaderPiece[] | null = null;
+    let lastDialogueSpeaker: string | null = null;
+    const closePara = () => {
+      if (para && para.length) out.push({ kind: "para", pieces: para });
+      para = null;
+    };
+    activeSegments.forEach((seg, segIdx) => {
+      if (seg.isTitle) {
+        closePara();
+        out.push({ kind: "title", segIdx, text: seg.text });
+        return;
+      }
+      if (seg.kind === "sfx") {
+        closePara();
+        out.push({ kind: "sfx", segIdx });
+        return;
+      }
+      if (seg.paraBreakBefore || !para) {
+        closePara();
+        para = [];
+      } else if (seg.spaceBefore && para.length) {
+        // Re-insert the whitespace trimmed at storage between segments, onto
+        // the previous piece so it renders outside any speaker label.
+        para[para.length - 1] = {
+          ...para[para.length - 1],
+          text: para[para.length - 1].text + " ",
+        };
+      }
+      const label =
+        seg.kind === "dialogue" && seg.characterId !== lastDialogueSpeaker
+          ? seg.characterName
+          : undefined;
+      if (seg.kind === "dialogue") lastDialogueSpeaker = seg.characterId;
+      seg.phrases.forEach((phrase, phraseIdx) => {
+        const chunks = phrase.text.split(/\n\s*\n/);
+        chunks.forEach((chunk, ci) => {
+          if (ci > 0) {
+            closePara();
+            para = [];
+          }
+          if (!chunk.trim()) return;
+          para!.push({
+            segIdx,
+            phraseIdx,
+            text: chunk,
+            label: phraseIdx === 0 && ci === 0 ? label : undefined,
+          });
+        });
+      });
+    });
+    closePara();
+    return out;
+  }, [activeSegments]);
+
+  // Keep the active line centered in the transcript panel — but hands off
+  // while the reader is scrolling on their own (following resumes after a few
+  // seconds of scroll inactivity).
   useEffect(() => {
     if (activeIdx < 0) return;
     const container = scrollRef.current;
-    const el = container?.querySelector<HTMLElement>(`[data-seg-idx="${activeIdx}"]`);
+    const el = container?.querySelector<HTMLElement>(
+      `[data-seg-idx="${activeIdx}"][data-phrase-idx="${Math.max(activePhraseIdx, 0)}"]`
+    );
     if (!container || !el) return;
-    container.scrollTo({
-      top: el.offsetTop - container.clientHeight / 2 + el.clientHeight / 2,
-      behavior: "smooth",
-    });
-  }, [activeIdx]);
+    if (Date.now() - userScrolledAtRef.current < 4000) return;
+    // offsetTop is relative to the offsetParent (the page, not this
+    // unpositioned container), so measure via bounding rects instead.
+    const cBox = container.getBoundingClientRect();
+    const eBox = el.getBoundingClientRect();
+    // Dead band: only scroll when the active phrase drifts out of the middle
+    // ~50% of the viewport, so it doesn't twitch on every phrase.
+    const rel = eBox.top + eBox.height / 2 - cBox.top;
+    if (rel > container.clientHeight * 0.25 && rel < container.clientHeight * 0.75) return;
+    const raw =
+      container.scrollTop + (eBox.top - cBox.top) - (container.clientHeight - eBox.height) / 2;
+    const top = Math.max(0, Math.min(container.scrollHeight - container.clientHeight, raw));
+    if (Math.abs(top - container.scrollTop) < 4) return;
+    const auto = autoScrollRef.current;
+    auto.active = true;
+    if (auto.timer) clearTimeout(auto.timer);
+    // Fallback for browsers without scrollend, and for interrupted animations
+    auto.timer = setTimeout(() => {
+      auto.active = false;
+    }, 800);
+    container.scrollTo({ top, behavior: "smooth" });
+  }, [activeIdx, activePhraseIdx]);
 
   const seekTo = (startSec: number) => {
     const audio = audioRef.current;
     if (!audio) return;
+    userScrolledAtRef.current = 0; // clicking a line opts back into following
     audio.currentTime = startSec;
     if (!playing) audio.play();
   };
@@ -297,81 +422,90 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
             ) : script.error ? (
               <p className="py-8 text-center text-sm text-muted-foreground">{script.error}</p>
             ) : (
-              <div ref={scrollRef} className="max-h-[55vh] space-y-1 overflow-y-auto pr-3">
-                {script.segments!.map((seg, i) => {
-                  const active = i === activeIdx;
-                  if (seg.kind === "sfx") {
+              <div
+                ref={scrollRef}
+                onScroll={() => {
+                  if (!autoScrollRef.current.active) userScrolledAtRef.current = Date.now();
+                }}
+                onScrollEnd={() => {
+                  autoScrollRef.current.active = false;
+                }}
+                className="max-h-[65vh] overflow-y-auto"
+              >
+                <div className="mx-auto max-w-[65ch] px-2 font-serif text-[17px] leading-8 text-foreground/90">
+                  {blocks.map((block, bi) => {
+                    if (block.kind === "title") {
+                      return (
+                        <p
+                          key={bi}
+                          data-seg-idx={block.segIdx}
+                          data-phrase-idx={0}
+                          onClick={() => seekTo(script.segments![block.segIdx].startSec)}
+                          className="mb-6 mt-2 cursor-pointer text-center font-sans text-sm font-medium uppercase tracking-wide text-muted-foreground"
+                        >
+                          {block.text}
+                        </p>
+                      );
+                    }
+                    if (block.kind === "sfx") {
+                      const seg = script.segments![block.segIdx];
+                      const active = block.segIdx === activeIdx;
+                      return (
+                        <div
+                          key={bi}
+                          data-seg-idx={block.segIdx}
+                          data-phrase-idx={0}
+                          onClick={() => seekTo(seg.startSec)}
+                          className={cn(
+                            "my-5 flex cursor-pointer items-center justify-center gap-2 font-sans text-xs",
+                            active ? "text-foreground" : "text-muted-foreground"
+                          )}
+                        >
+                          <Volume2 className="h-3 w-3 shrink-0" />
+                          <span className="italic">{seg.text}</span>
+                        </div>
+                      );
+                    }
                     return (
-                      <div
-                        key={seg.id}
-                        data-seg-idx={i}
-                        onClick={() => seekTo(seg.startSec)}
-                        className={cn(
-                          "flex cursor-pointer items-center gap-2 rounded-md border-l-2 border-transparent py-1.5 pl-3 pr-2 transition-colors",
-                          active
-                            ? "bg-primary/10"
-                            : "opacity-60 hover:bg-muted/50 hover:opacity-100"
-                        )}
-                      >
-                        <Volume2 className="h-3 w-3 shrink-0 text-muted-foreground" />
-                        <span className="text-xs font-medium text-muted-foreground">
-                          Sound effect
-                        </span>
-                        <span className="truncate text-sm italic text-muted-foreground">
-                          {seg.text}
-                        </span>
-                      </div>
+                      <p key={bi} className="my-4">
+                        {block.pieces.map((p, pi) => {
+                          const seg = script.segments![p.segIdx];
+                          const phrase = seg.phrases[p.phraseIdx];
+                          const active =
+                            p.segIdx === activeIdx && p.phraseIdx === activePhraseIdx;
+                          const color =
+                            seg.kind === "dialogue" ? speakerColor(seg.characterId) : undefined;
+                          return (
+                            <Fragment key={pi}>
+                              {p.label && (
+                                <span
+                                  className="mr-1.5 font-sans text-xs font-medium"
+                                  style={{ color }}
+                                >
+                                  {p.label}
+                                </span>
+                              )}
+                              <span
+                                data-seg-idx={p.segIdx}
+                                data-phrase-idx={p.phraseIdx}
+                                onClick={() => seekTo(phrase.startSec)}
+                                title={seg.kind === "dialogue" ? seg.characterName : undefined}
+                                style={{ color }}
+                                className={cn(
+                                  "cursor-pointer rounded-sm transition-colors duration-200",
+                                  active ? "bg-primary/25 text-foreground" : "hover:bg-muted",
+                                  seg.kind === "narration" && !active && "text-foreground/80"
+                                )}
+                              >
+                                {p.text}
+                              </span>
+                            </Fragment>
+                          );
+                        })}
+                      </p>
                     );
-                  }
-                  const speakerChanged =
-                    i === 0 || script.segments![i - 1].characterId !== seg.characterId;
-                  const color = speakerColor(seg.characterId);
-                  return (
-                    <div
-                      key={seg.id}
-                      data-seg-idx={i}
-                      onClick={() => seekTo(seg.startSec)}
-                      className={cn(
-                        "cursor-pointer rounded-md border-l-2 py-1.5 pl-3 pr-2 transition-colors",
-                        active
-                          ? "bg-primary/10"
-                          : "border-transparent opacity-70 hover:bg-muted/50 hover:opacity-100"
-                      )}
-                      style={{ borderLeftColor: active || seg.kind === "dialogue" ? color : undefined }}
-                    >
-                      {speakerChanged && seg.kind === "dialogue" && (
-                        <span className="mr-2 text-xs font-medium" style={{ color }}>
-                          {seg.characterName}
-                        </span>
-                      )}
-                      <span
-                        className={cn(
-                          "text-sm leading-relaxed",
-                          active ? "text-foreground" : "text-foreground/80",
-                          seg.kind === "narration" && "text-muted-foreground"
-                        )}
-                      >
-                        {seg.phrases.map((phrase, p) => (
-                          <span
-                            key={p}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              seekTo(phrase.startSec);
-                            }}
-                            className={cn(
-                              "rounded-sm transition-colors duration-200",
-                              active && p === activePhraseIdx
-                                ? "bg-primary/25 text-foreground"
-                                : "hover:bg-muted"
-                            )}
-                          >
-                            {phrase.text}
-                          </span>
-                        ))}
-                      </span>
-                    </div>
-                  );
-                })}
+                  })}
+                </div>
               </div>
             )}
           </CardContent>
@@ -382,10 +516,37 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
         <p className="text-sm text-muted-foreground">
           {playable.length} of {chapters.length} chapters generated
         </p>
-        <Button variant="outline" asChild>
-          <a href={`/api/books/${book.id}/download`}>
-            <Download className="h-4 w-4" /> Download all (.zip)
-          </a>
+        <Button
+          variant="outline"
+          disabled={zipping || playable.length === 0}
+          onClick={async () => {
+            // Zip in the browser: chapters stream from the CDN, so no server
+            // function ever holds the whole book in memory.
+            setZipping(true);
+            try {
+              const JSZip = (await import("jszip")).default;
+              const zip = new JSZip();
+              for (const ch of playable) {
+                const res = await fetch(`/api/audio/${ch.audioPath}`);
+                if (!res.ok) throw new Error(`Chapter ${ch.idx + 1} download failed`);
+                zip.file(
+                  `${String(ch.idx + 1).padStart(2, "0")} - ${safeName(ch.title, `Chapter ${ch.idx + 1}`)}.mp3`,
+                  await res.blob()
+                );
+              }
+              saveBlob(
+                await zip.generateAsync({ type: "blob", compression: "STORE" }),
+                `${safeName(book.title, "audiobook")}.zip`
+              );
+            } catch (err) {
+              toast.error(err instanceof Error ? err.message : "Download failed");
+            } finally {
+              setZipping(false);
+            }
+          }}
+        >
+          {zipping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+          Download all (.zip)
         </Button>
       </div>
 
@@ -426,10 +587,17 @@ export function ListenTab({ book, chapters }: { book: BookData; chapters: Chapte
             <span className="font-mono text-xs text-muted-foreground">
               {ch.durationSec ? formatDuration(ch.durationSec) : ""}
             </span>
-            <Button variant="ghost" size="icon" className="h-8 w-8" asChild>
-              <a href={`/api/audio/${ch.audioPath}`} download={`${ch.idx + 1} - ${ch.title}.mp3`}>
-                <Download className="h-4 w-4" />
-              </a>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8"
+              onClick={() =>
+                saveAudio(ch.audioPath!, `${ch.idx + 1} - ${ch.title}.mp3`).catch(() =>
+                  toast.error("Download failed")
+                )
+              }
+            >
+              <Download className="h-4 w-4" />
             </Button>
           </div>
         ))}

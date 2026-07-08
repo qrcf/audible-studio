@@ -2,52 +2,54 @@ import { cache } from "react";
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { asc, eq } from "drizzle-orm";
-import { db, books, chapters, characters, voiceAssignments } from "@/lib/db";
+import { getDb, books, chapters, characters, voiceAssignments } from "@/lib/db";
 import { BookView } from "@/components/book/book-view";
 import type { BookData, ChapterMeta, CharacterData } from "@/components/book/types";
 
 export const dynamic = "force-dynamic";
 
-const getBook = cache((id: string) =>
-  db.select().from(books).where(eq(books.id, id)).get()
-);
+const getBook = cache(async (id: string) => {
+  const [book] = await getDb().select().from(books).where(eq(books.id, id)).limit(1);
+  return book;
+});
 
 export async function generateMetadata({
   params,
 }: {
   params: Promise<{ id: string }>;
 }): Promise<Metadata> {
-  const book = getBook((await params).id);
+  const book = await getBook((await params).id);
   return { title: book ? `${book.title} · Audiobook Studio` : "Audiobook Studio" };
 }
 
 export default async function BookPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const book = getBook(id);
+  const db = getDb();
+  // The chapter/character queries only need the id — run all three together
+  // instead of gating them on the book lookup.
+  const [book, chapterRows, characterRows] = await Promise.all([
+    getBook(id),
+    db
+      .select({
+        id: chapters.id,
+        idx: chapters.idx,
+        title: chapters.title,
+        charCount: chapters.charCount,
+        status: chapters.status,
+        durationSec: chapters.durationSec,
+        audioPath: chapters.audioPath,
+        error: chapters.error,
+      })
+      .from(chapters)
+      .where(eq(chapters.bookId, id))
+      .orderBy(asc(chapters.idx)),
+    db
+      .select()
+      .from(characters)
+      .leftJoin(voiceAssignments, eq(voiceAssignments.characterId, characters.id))
+      .where(eq(characters.bookId, id)),
+  ]);
   if (!book) notFound();
-
-  const chapterRows = db
-    .select({
-      id: chapters.id,
-      idx: chapters.idx,
-      title: chapters.title,
-      charCount: chapters.charCount,
-      status: chapters.status,
-      durationSec: chapters.durationSec,
-      audioPath: chapters.audioPath,
-      error: chapters.error,
-    })
-    .from(chapters)
-    .where(eq(chapters.bookId, id))
-    .orderBy(asc(chapters.idx))
-    .all();
-
-  const characterRows = db
-    .select()
-    .from(characters)
-    .leftJoin(voiceAssignments, eq(voiceAssignments.characterId, characters.id))
-    .where(eq(characters.bookId, id))
-    .all();
 
   const bookData: BookData = {
     id: book.id,

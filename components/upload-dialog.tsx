@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useRef, useState } from "react";
+import { upload } from "@vercel/blob/client";
 import { FileText, Loader2, Upload } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -30,9 +31,17 @@ export function UploadDialog() {
     if (!file) return;
     setUploading(true);
     try {
-      const form = new FormData();
-      form.append("file", file);
-      const res = await fetch("/api/books", { method: "POST", body: form });
+      if (file.size > 30 * 1024 * 1024) throw new Error("File too large (max 30 MB)");
+      // Straight to Blob storage — serverless request bodies cap at 4.5 MB
+      const blob = await upload(`uploads/${file.name}`, file, {
+        access: "private",
+        handleUploadUrl: "/api/books/upload-token",
+      });
+      const res = await fetch("/api/books", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ uploadPathname: blob.pathname, fileName: file.name }),
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? "Upload failed");
       toast.success(`Added — ${data.chapterCount} chapters detected`);

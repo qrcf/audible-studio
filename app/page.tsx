@@ -1,37 +1,41 @@
 import { desc, eq, sql } from "drizzle-orm";
 import { BookOpen } from "lucide-react";
-import { db, books, chapters, characters } from "@/lib/db";
+import { getDb, books, chapters, characters } from "@/lib/db";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { BookCard } from "@/components/book-card";
 import { UploadDialog } from "@/components/upload-dialog";
 
 export const dynamic = "force-dynamic";
 
-export default function LibraryPage() {
-  const rows = db
-    .select({
-      book: books,
-      chapterCount: sql<number>`count(distinct ${chapters.id})`,
-      charCount: sql<number>`coalesce(sum(${chapters.charCount}), 0)`,
-    })
-    .from(books)
-    .leftJoin(chapters, eq(chapters.bookId, books.id))
-    .groupBy(books.id)
-    .orderBy(desc(books.createdAt))
-    .all();
-
-  const characterCounts = new Map(
+export default async function LibraryPage() {
+  const db = getDb();
+  const [rows, characterRows] = await Promise.all([
     db
-      .select({ bookId: characters.bookId, n: sql<number>`count(*)` })
+      .select({
+        book: books,
+        chapterCount: sql<number>`count(distinct ${chapters.id})`.mapWith(Number),
+        charCount: sql<number>`coalesce(sum(${chapters.charCount}), 0)`.mapWith(Number),
+      })
+      .from(books)
+      .leftJoin(chapters, eq(chapters.bookId, books.id))
+      .groupBy(books.id)
+      .orderBy(desc(books.createdAt)),
+    db
+      .select({ bookId: characters.bookId, n: sql<number>`count(*)`.mapWith(Number) })
       .from(characters)
-      .groupBy(characters.bookId)
-      .all()
-      .map((r) => [r.bookId, r.n])
-  );
+      .groupBy(characters.bookId),
+  ]);
+  const characterCounts = new Map(characterRows.map((r) => [r.bookId, r.n]));
 
-  const missingKeys = (["ANTHROPIC_API_KEY", "ELEVENLABS_API_KEY"] as const).filter(
-    (k) => !process.env[k]
-  );
+  const missingKeys = (
+    [
+      "ANTHROPIC_API_KEY",
+      "ELEVENLABS_API_KEY",
+      "DATABASE_URL",
+      "BLOB_READ_WRITE_TOKEN",
+      "SESSION_SECRET",
+    ] as const
+  ).filter((k) => !process.env[k]);
 
   return (
     <div className="space-y-6">

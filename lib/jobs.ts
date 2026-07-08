@@ -1,103 +1,178 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
-import { db, jobs } from "@/lib/db";
+import { and, eq, lt, sql } from "drizzle-orm";
+import { getRun } from "workflow/api";
+import { getDb, jobs } from "@/lib/db";
 import type { JobStatus } from "@/lib/db/schema";
 import { JobCancelledError } from "@/lib/errors";
 
-export function createJob(
+export async function createJob(
   type: "analyze" | "cast" | "script" | "generate",
   bookId: string,
   chapterId?: string
-): string {
+): Promise<string> {
   const id = randomUUID();
-  db.insert(jobs).values({ id, type, bookId, chapterId: chapterId ?? null }).run();
+  await getDb().insert(jobs).values({ id, type, bookId, chapterId: chapterId ?? null });
   return id;
 }
 
-export function setJobTotal(id: string, total: number): void {
-  db.update(jobs).set({ total, updatedAt: new Date() }).where(eq(jobs.id, id)).run();
+/** Record which workflow run is executing this job (cancel backstop + reconciler). */
+export async function attachRunId(jobId: string, runId: string): Promise<void> {
+  await getDb().update(jobs).set({ runId, updatedAt: new Date() }).where(eq(jobs.id, jobId));
 }
 
-export function tickJob(id: string, opts: { chars?: number; note?: string } = {}): void {
-  db.update(jobs)
+export async function setJobTotal(id: string, total: number): Promise<void> {
+  await getDb().update(jobs).set({ total, updatedAt: new Date() }).where(eq(jobs.id, id));
+}
+
+/**
+ * ABSOLUTE progress write, monotone via GREATEST — workflow steps retry after
+ * failures and must be able to re-report the same numbers without
+ * double-counting (which the old incremental tick could not survive).
+ */
+export async function setJobProgress(
+  id: string,
+  progress: { done?: number; charsUsed?: number; note?: string }
+): Promise<void> {
+  await getDb()
+    .update(jobs)
     .set({
-      done: sql`${jobs.done} + 1`,
-      charsUsed: sql`${jobs.charsUsed} + ${opts.chars ?? 0}`,
-      ...(opts.note !== undefined ? { note: opts.note } : {}),
+      ...(progress.done !== undefined
+        ? { done: sql`GREATEST(${jobs.done}, ${progress.done})` }
+        : {}),
+      ...(progress.charsUsed !== undefined
+        ? { charsUsed: sql`GREATEST(${jobs.charsUsed}, ${progress.charsUsed})` }
+        : {}),
+      ...(progress.note !== undefined ? { note: progress.note } : {}),
       updatedAt: new Date(),
     })
-    .where(eq(jobs.id, id))
-    .run();
+    .where(eq(jobs.id, id));
 }
 
-export function noteJob(id: string, note: string): void {
-  db.update(jobs).set({ note, updatedAt: new Date() }).where(eq(jobs.id, id)).run();
+export async function noteJob(id: string, note: string): Promise<void> {
+  await getDb().update(jobs).set({ note, updatedAt: new Date() }).where(eq(jobs.id, id));
 }
 
 // Terminal transitions only apply to running jobs so a cancellation that
 // lands first isn't overwritten by the worker's own complete/fail.
-export function completeJob(id: string): void {
-  db.update(jobs)
+export async function completeJob(id: string): Promise<void> {
+  await getDb()
+    .update(jobs)
     .set({ status: "completed", note: null, updatedAt: new Date() })
-    .where(and(eq(jobs.id, id), eq(jobs.status, "running")))
-    .run();
+    .where(and(eq(jobs.id, id), eq(jobs.status, "running")));
 }
 
-export function failJob(id: string, error: unknown): void {
+export async function failJob(id: string, error: unknown): Promise<void> {
   const message = error instanceof Error ? error.message : String(error);
-  db.update(jobs)
+  await getDb()
+    .update(jobs)
     .set({ status: "failed", error: message, updatedAt: new Date() })
-    .where(and(eq(jobs.id, id), eq(jobs.status, "running")))
-    .run();
+    .where(and(eq(jobs.id, id), eq(jobs.status, "running")));
 }
 
-export function cancelJob(id: string): boolean {
-  const result = db
+export async function cancelJob(id: string): Promise<boolean> {
+  const cancelled = await getDb()
     .update(jobs)
     .set({ status: "cancelled", note: null, updatedAt: new Date() })
     .where(and(eq(jobs.id, id), eq(jobs.status, "running")))
-    .run();
-  return result.changes > 0;
+    .returning({ id: jobs.id });
+  return cancelled.length > 0;
 }
 
 /** Cancel every running job for a book; returns how many were cancelled. */
-export function cancelBookJobs(bookId: string): number {
-  const result = db
+export async function cancelBookJobs(bookId: string): Promise<number> {
+  const cancelled = await getDb()
     .update(jobs)
     .set({ status: "cancelled", note: null, updatedAt: new Date() })
     .where(and(eq(jobs.bookId, bookId), eq(jobs.status, "running")))
-    .run();
-  return result.changes;
+    .returning({ id: jobs.id });
+  return cancelled.length;
 }
 
-export function jobStatus(id: string): JobStatus | undefined {
-  return db.select({ status: jobs.status }).from(jobs).where(eq(jobs.id, id)).get()?.status;
+export async function jobStatus(id: string): Promise<JobStatus | undefined> {
+  const rows = await getDb()
+    .select({ status: jobs.status })
+    .from(jobs)
+    .where(eq(jobs.id, id))
+    .limit(1);
+  return rows[0]?.status;
+}
+
+export async function isCancelled(id: string): Promise<boolean> {
+  return (await jobStatus(id)) === "cancelled";
 }
 
 /** Workers call this between units of work to honour cancellation quickly. */
-export function assertNotCancelled(id: string): void {
-  if (jobStatus(id) === "cancelled") throw new JobCancelledError();
+export async function assertNotCancelled(id: string): Promise<void> {
+  if (await isCancelled(id)) throw new JobCancelledError();
 }
 
+// Steps refresh updatedAt on every progress write, so a "running" job that has
+// been silent this long either lost its workflow run entirely (RUNTIME_ERROR,
+// deleted deployment) or is stuck in a long retry backoff.
+const STALE_AFTER_MS = 90_000;
+
 /**
- * Pulse updatedAt while `fn` runs so crash recovery (lib/db) can tell a live
- * job in a sibling Next.js worker process from one orphaned by a dead process
- * — long LLM calls otherwise leave no sign of life for minutes.
+ * Fail any zombie jobs whose workflow run is no longer running, then roll
+ * their book/chapter back to the last stable status. Replaces the old
+ * boot-time recoverInterruptedWork; called from the (2s-polled) progress
+ * route, so it costs nothing until something actually looks stale.
  */
-export async function withHeartbeat<T>(jobId: string, fn: () => Promise<T>): Promise<T> {
-  const timer = setInterval(() => {
-    try {
-      db.update(jobs)
-        .set({ updatedAt: new Date() })
-        .where(and(eq(jobs.id, jobId), eq(jobs.status, "running")))
-        .run();
-    } catch {
-      // DB hiccups shouldn't kill the work; the next pulse retries
+export async function reconcileStaleJobs(bookId: string): Promise<number> {
+  const db = getDb();
+  const stale = await db
+    .select({ id: jobs.id, chapterId: jobs.chapterId, runId: jobs.runId })
+    .from(jobs)
+    .where(
+      and(
+        eq(jobs.bookId, bookId),
+        eq(jobs.status, "running"),
+        lt(jobs.updatedAt, new Date(Date.now() - STALE_AFTER_MS))
+      )
+    );
+  if (stale.length === 0) return 0;
+
+  let recovered = 0;
+  for (const job of stale) {
+    let dead = !job.runId; // pre-workflow rows have no run to be alive in
+    if (job.runId) {
+      try {
+        const status = await getRun(job.runId).status;
+        dead = status !== "running" && status !== "pending";
+      } catch {
+        dead = true; // run unknown to the backend — treat as gone
+      }
     }
-  }, 20_000);
-  try {
-    return await fn();
-  } finally {
-    clearInterval(timer);
+    if (!dead) continue;
+    recovered++;
+
+    await db
+      .update(jobs)
+      .set({
+        status: "failed",
+        note: null,
+        error: "Interrupted — retry it",
+        updatedAt: new Date(),
+      })
+      .where(and(eq(jobs.id, job.id), eq(jobs.status, "running")));
+
+    if (job.chapterId) {
+      await db.execute(sql`
+        UPDATE chapters SET status = CASE
+            WHEN EXISTS (SELECT 1 FROM segments WHERE segments.chapter_id = chapters.id) THEN 'scripted'
+            ELSE 'pending' END
+        WHERE id = ${job.chapterId} AND status IN ('scripting','generating')`);
+    }
   }
+
+  if (recovered > 0) {
+    // Roll the book back only when no live job still owns it
+    await db.execute(sql`
+      UPDATE books SET status = CASE
+          WHEN status = 'generating' THEN 'cast'
+          WHEN EXISTS (SELECT 1 FROM characters WHERE characters.book_id = books.id) THEN 'analyzed'
+          ELSE 'parsed' END
+      WHERE id = ${bookId} AND status IN ('analyzing','casting','generating')
+        AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.book_id = books.id AND jobs.status = 'running')`);
+  }
+  return recovered;
 }

@@ -20,6 +20,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
+import { titleAnnouncement } from "@/lib/analysis/clean";
 import { DELIVERY_VALUES } from "@/lib/delivery";
 import { estimateCredits, estimateSfxCredits, formatCredits } from "@/lib/format";
 import { speakerColor } from "./speaker-colors";
@@ -72,6 +73,19 @@ export function ScriptSheet({
   const segments = chapter && loaded?.chapterId === chapter.id ? loaded.segments : null;
   const nameById = new Map(characters.map((c) => [c.id, c.name]));
   const speakables = characters.filter((c) => !c.isNarrator);
+  // The chapter-title announcement always stays with the book narrator, so it
+  // doesn't count toward (or get changed by) the chapter's narrating voice.
+  const isTitleSegment = (s: SegmentRow) =>
+    s.idx === 0 &&
+    s.kind === "narration" &&
+    chapter !== null &&
+    s.text === titleAnnouncement(chapter.title);
+  const narrationIds = new Set(
+    (segments ?? [])
+      .filter((s) => s.kind === "narration" && !isTitleSegment(s))
+      .map((s) => s.characterId ?? NARRATOR_VALUE)
+  );
+  const chapterNarrator = narrationIds.size === 1 ? [...narrationIds][0] : NARRATOR_VALUE;
   const flaggedCount = segments?.filter((s) => s.flagged).length ?? 0;
   const speechChars =
     segments?.reduce((n, s) => n + (s.kind === "sfx" ? 0 : s.text.length), 0) ?? 0;
@@ -112,6 +126,31 @@ export function ScriptSheet({
         }
     );
     toast.success("Speaker updated — regenerate the chapter to hear it");
+  }
+
+  async function setChapterNarrator(value: string) {
+    if (!chapter) return;
+    const characterId = value === NARRATOR_VALUE ? null : value;
+    const res = await fetch(`/api/chapters/${chapter.id}/narrator`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ characterId }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      toast.error(data.error ?? "Failed to update narrator");
+      return;
+    }
+    setLoaded(
+      (prev) =>
+        prev && {
+          ...prev,
+          segments: prev.segments.map((s) =>
+            s.kind === "narration" && !isTitleSegment(s) ? { ...s, characterId } : s
+          ),
+        }
+    );
+    toast.success("Narration voice updated — regenerate the chapter to hear it");
   }
 
   async function setDelivery(segment: SegmentRow, value: string) {
@@ -161,6 +200,24 @@ export function ScriptSheet({
               : "Loading…"}
             {flaggedCount > 0 && ` · ${flaggedCount} flagged for review`}
           </SheetDescription>
+          {segments && segments.length > 0 && speakables.length > 0 && (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-muted-foreground">Narrated by</span>
+              <Select value={chapterNarrator} onValueChange={setChapterNarrator}>
+                <SelectTrigger className="h-7 w-44 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NARRATOR_VALUE}>Narrator</SelectItem>
+                  {speakables.map((c) => (
+                    <SelectItem key={c.id} value={c.id}>
+                      {c.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+          )}
         </SheetHeader>
 
         {!segments ? (

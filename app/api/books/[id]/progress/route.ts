@@ -1,9 +1,13 @@
 import { asc, desc, eq } from "drizzle-orm";
-import { db, books, chapters, jobs } from "@/lib/db";
+import { getDb, books, chapters, jobs } from "@/lib/db";
+import { reconcileStaleJobs } from "@/lib/jobs";
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
-  const book = db
+  const db = getDb();
+  // Fail zombie jobs whose workflow run has died (replaces boot-time recovery)
+  await reconcileStaleJobs(id);
+  const [book] = await db
     .select({
       id: books.id,
       status: books.status,
@@ -12,10 +16,10 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     })
     .from(books)
     .where(eq(books.id, id))
-    .get();
+    .limit(1);
   if (!book) return Response.json({ error: "Not found" }, { status: 404 });
 
-  const chapterRows = db
+  const chapterRows = await db
     .select({
       id: chapters.id,
       idx: chapters.idx,
@@ -26,16 +30,14 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     })
     .from(chapters)
     .where(eq(chapters.bookId, id))
-    .orderBy(asc(chapters.idx))
-    .all();
+    .orderBy(asc(chapters.idx));
 
-  const jobRows = db
+  const jobRows = await db
     .select()
     .from(jobs)
     .where(eq(jobs.bookId, id))
     .orderBy(desc(jobs.createdAt))
-    .limit(25)
-    .all();
+    .limit(25);
 
   return Response.json({ book, chapters: chapterRows, jobs: jobRows });
 }
