@@ -1,10 +1,9 @@
-import { eq } from "drizzle-orm";
-import { start } from "workflow/api";
-import { getDb, chapters, segments } from "@/lib/db";
+import { and, eq, inArray } from "drizzle-orm";
+import { getDb, chapters, jobs, segments } from "@/lib/db";
 import { errorResponse, AppError, requireEnv } from "@/lib/errors";
-import { attachRunId, createJob } from "@/lib/jobs";
-import { getAssignmentResolver } from "@/lib/generation";
-import { generateChapterWorkflow } from "@/workflows/generate-chapter";
+import { enqueueJob } from "@/lib/jobs";
+import { getAssignmentResolver, refreshBookStatus } from "@/lib/generation";
+import { dispatchAll } from "@/lib/queue";
 
 export async function POST(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -16,6 +15,15 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
     if (chapter.status === "generating" || chapter.status === "scripting") {
       throw new AppError("Chapter is busy", "busy", 409);
     }
+    // A queued generate job (chapter still reads "scripted") already covers this.
+    const dup = await db
+      .select({ id: jobs.id })
+      .from(jobs)
+      .where(
+        and(eq(jobs.chapterId, id), eq(jobs.type, "generate"), inArray(jobs.status, ["queued", "running"]))
+      )
+      .limit(1);
+    if (dup.length > 0) throw new AppError("Chapter is already queued", "busy", 409);
 
     const segs = await db
       .select({ characterId: segments.characterId, kind: segments.kind })
@@ -30,10 +38,10 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
       throw new AppError(`No voice assigned for: ${missing.join(", ")}. Cast voices first.`, "uncast");
     }
 
-    const jobId = await createJob("generate", chapter.bookId, id);
-    await db.update(chapters).set({ status: "generating", error: null }).where(eq(chapters.id, id));
-    const run = await start(generateChapterWorkflow, [id, jobId]);
-    await attachRunId(jobId, run.runId);
+    // Enqueue and let the bounded dispatcher start it when a slot is free.
+    const jobId = await enqueueJob("generate", chapter.bookId, id);
+    await dispatchAll();
+    await refreshBookStatus(chapter.bookId);
     return Response.json({ jobId });
   } catch (err) {
     return errorResponse(err);

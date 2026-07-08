@@ -31,7 +31,7 @@ export function ChaptersTab({
   chapters,
   characters,
   jobs,
-  busy,
+  generateActive,
   keys,
   onGenerateAll,
 }: {
@@ -39,7 +39,7 @@ export function ChaptersTab({
   chapters: ChapterMeta[];
   characters: CharacterData[];
   jobs: JobData[];
-  busy: boolean;
+  generateActive: boolean;
   keys: ApiKeysPresent;
   onGenerateAll: () => void;
 }) {
@@ -75,7 +75,7 @@ export function ChaptersTab({
               Scripting splits a chapter into narrator and character lines; generation renders
               each line with its cast voice and stitches the chapter MP3.
             </p>
-            <Button onClick={onGenerateAll} disabled={busy || !hasCast || !keys.eleven}>
+            <Button onClick={onGenerateAll} disabled={generateActive || !hasCast || !keys.eleven}>
               <Play className="h-4 w-4" /> Generate all
             </Button>
           </div>
@@ -97,7 +97,10 @@ export function ChaptersTab({
             <TableBody>
               {chapters.map((ch) => {
                 const job = jobByChapter.get(ch.id);
-                const chapterBusy = ch.status === "scripting" || ch.status === "generating";
+                // `jobs` are the active (running + queued) rows, so any job here
+                // means this chapter is busy — even while merely queued.
+                const chapterBusy =
+                  ch.status === "scripting" || ch.status === "generating" || Boolean(job);
                 const hasScript = !["pending", "scripting"].includes(ch.status);
                 const rowPending = pending === ch.id;
 
@@ -134,16 +137,22 @@ export function ChaptersTab({
                       </div>
                     </TableCell>
                     <TableCell>
-                      {job && job.status === "running" ? (
+                      {job && (job.status === "running" || job.status === "queued") ? (
                         <div className="flex items-center gap-1.5">
                           <div className="min-w-0 flex-1 space-y-1">
-                            <Progress
-                              value={job.total > 0 ? (job.done / job.total) * 100 : undefined}
-                              className="h-1.5"
-                            />
-                            <p className="truncate text-xs text-muted-foreground">
-                              {job.note ?? `${job.done}/${job.total}`}
-                            </p>
+                            {job.status === "queued" ? (
+                              <p className="text-xs text-muted-foreground">Queued</p>
+                            ) : (
+                              <>
+                                <Progress
+                                  value={job.total > 0 ? (job.done / job.total) * 100 : undefined}
+                                  className="h-1.5"
+                                />
+                                <p className="truncate text-xs text-muted-foreground">
+                                  {job.note ?? `${job.done}/${job.total}`}
+                                </p>
+                              </>
+                            )}
                           </div>
                           {!readOnly && (
                             <Tooltip>

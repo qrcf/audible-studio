@@ -4,6 +4,8 @@ import { useRouter } from "next/navigation";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   BookOpenText,
+  ChevronLeft,
+  ChevronRight,
   Download,
   Headphones,
   Loader2,
@@ -151,12 +153,16 @@ export function ListenTab({
   const [readAlong, setReadAlong] = useState(true);
   const [zipping, setZipping] = useState(false);
   const [script, setScript] = useState<ReadalongScript | null>(null);
-  const scrollRef = useRef<HTMLDivElement | null>(null);
-  const autoScrollRef = useRef<{ active: boolean; timer: ReturnType<typeof setTimeout> | null }>({
-    active: false,
-    timer: null,
-  });
-  const userScrolledAtRef = useRef(0);
+  // Pagination: the reader shows one page at a time and turns automatically as
+  // the highlight advances. `pages` holds the pixel offset of each page's first
+  // block (a page break never splits a block); `pageIdx` is the visible page.
+  const pageViewportRef = useRef<HTMLDivElement | null>(null);
+  const pageInnerRef = useRef<HTMLDivElement | null>(null);
+  const [pages, setPages] = useState<number[]>([0]);
+  const [pageIdx, setPageIdx] = useState(0);
+  // While the reader turns pages by hand, auto-follow pauses briefly so it
+  // doesn't yank back to the playhead mid-read.
+  const userPagedAtRef = useRef(0);
 
   const play = useCallback(
     (chapter: ChapterMeta) => {
@@ -167,6 +173,7 @@ export function ListenTab({
         audio.playbackRate = Number(rate);
         setCurrent(chapter);
         setTime(0);
+        setPageIdx(0); // a new chapter opens on its first page
       }
       audio.play();
     },
@@ -318,43 +325,77 @@ export function ListenTab({
     return out;
   }, [activeSegments]);
 
-  // Keep the active line centered in the transcript panel — but hands off
-  // while the reader is scrolling on their own (following resumes after a few
-  // seconds of scroll inactivity).
+  // Slice the flowing text into pages that fill the viewport without ever
+  // splitting a block: walk the rendered blocks, and whenever the next one
+  // would overflow the current page, start a fresh page at its top offset.
+  const recomputePages = useCallback(() => {
+    const viewport = pageViewportRef.current;
+    const inner = pageInnerRef.current;
+    if (!viewport || !inner) return;
+    const h = viewport.clientHeight;
+    if (h <= 0) return;
+    const starts = [0];
+    let pageTop = 0;
+    for (const el of inner.querySelectorAll<HTMLElement>("[data-block-idx]")) {
+      const top = el.offsetTop;
+      const bottom = top + el.offsetHeight;
+      if (top > pageTop && bottom - pageTop > h) {
+        pageTop = top;
+        starts.push(top);
+      }
+    }
+    setPages((prev) =>
+      prev.length === starts.length && prev.every((v, i) => v === starts[i]) ? prev : starts
+    );
+  }, []);
+
+  // Recompute on content or size changes (fonts loading, window resize, chapter
+  // swap). Observing the inner element also catches late reflow.
+  useEffect(() => {
+    recomputePages();
+    const viewport = pageViewportRef.current;
+    const inner = pageInnerRef.current;
+    if (!viewport || !inner) return;
+    const ro = new ResizeObserver(() => recomputePages());
+    ro.observe(viewport);
+    ro.observe(inner);
+    return () => ro.disconnect();
+  }, [blocks, recomputePages]);
+
+  // pageIdx can briefly outrun the page count after a re-paginate; clamp at read
+  // time so we never translate past the last page. (play() resets to page 0 on a
+  // chapter change; a resize keeps the current page and auto-follow re-seeks it.)
+  const pageCount = pages.length;
+  const currentPage = Math.min(pageIdx, pageCount - 1);
+
+  // Turn to the page holding the active phrase — unless the reader just paged
+  // by hand, in which case following stands down for a few seconds.
   useEffect(() => {
     if (activeIdx < 0) return;
-    const container = scrollRef.current;
-    const el = container?.querySelector<HTMLElement>(
+    if (Date.now() - userPagedAtRef.current < 4000) return;
+    const inner = pageInnerRef.current;
+    const el = inner?.querySelector<HTMLElement>(
       `[data-seg-idx="${activeIdx}"][data-phrase-idx="${Math.max(activePhraseIdx, 0)}"]`
     );
-    if (!container || !el) return;
-    if (Date.now() - userScrolledAtRef.current < 4000) return;
-    // offsetTop is relative to the offsetParent (the page, not this
-    // unpositioned container), so measure via bounding rects instead.
-    const cBox = container.getBoundingClientRect();
-    const eBox = el.getBoundingClientRect();
-    // Dead band: only scroll when the active phrase drifts out of the middle
-    // ~50% of the viewport, so it doesn't twitch on every phrase.
-    const rel = eBox.top + eBox.height / 2 - cBox.top;
-    if (rel > container.clientHeight * 0.25 && rel < container.clientHeight * 0.75) return;
-    const raw =
-      container.scrollTop + (eBox.top - cBox.top) - (container.clientHeight - eBox.height) / 2;
-    const top = Math.max(0, Math.min(container.scrollHeight - container.clientHeight, raw));
-    if (Math.abs(top - container.scrollTop) < 4) return;
-    const auto = autoScrollRef.current;
-    auto.active = true;
-    if (auto.timer) clearTimeout(auto.timer);
-    // Fallback for browsers without scrollend, and for interrupted animations
-    auto.timer = setTimeout(() => {
-      auto.active = false;
-    }, 800);
-    container.scrollTo({ top, behavior: "smooth" });
-  }, [activeIdx, activePhraseIdx]);
+    if (!el) return;
+    const offset = el.offsetTop;
+    let target = 0;
+    for (let i = 0; i < pages.length; i++) {
+      if (pages[i] <= offset + 1) target = i;
+      else break;
+    }
+    setPageIdx((cur) => (cur === target ? cur : target));
+  }, [activeIdx, activePhraseIdx, pages]);
+
+  const goToPage = (i: number) => {
+    userPagedAtRef.current = Date.now();
+    setPageIdx(Math.max(0, Math.min(pages.length - 1, i)));
+  };
 
   const seekTo = (startSec: number) => {
     const audio = audioRef.current;
     if (!audio) return;
-    userScrolledAtRef.current = 0; // clicking a line opts back into following
+    userPagedAtRef.current = 0; // clicking a line opts back into following
     audio.currentTime = startSec;
     if (!playing) audio.play();
   };
@@ -397,9 +438,143 @@ export function ListenTab({
     }
   }
 
+  // The paginated reader sits above the transport. When it's showing, the
+  // controls ride directly beneath it in normal flow (text over controls);
+  // with no reader, they pin to the top so they stay reachable down the list.
+  const showReader = Boolean(readAlong && current && current.id !== INTRO_ID);
+
   return (
     <div className="space-y-4">
-      <Card className="sticky top-16 z-30 border-primary/20 bg-card/95 backdrop-blur">
+      {showReader && current && (
+        <Card>
+          <CardContent className="py-4">
+            {!script || script.chapterId !== current.id ? (
+              <div className="flex items-center justify-center gap-2 py-10 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" /> Loading script…
+              </div>
+            ) : script.error ? (
+              <p className="py-8 text-center text-sm text-muted-foreground">{script.error}</p>
+            ) : (
+              <>
+                <div ref={pageViewportRef} className="relative h-[60vh] overflow-hidden">
+                  <div
+                    ref={pageInnerRef}
+                    style={{ transform: `translateY(${-(pages[currentPage] ?? 0)}px)` }}
+                    className="relative mx-auto max-w-[65ch] px-2 font-serif text-[17px] leading-8 text-foreground/90 transition-transform duration-500 ease-out"
+                  >
+                    {blocks.map((block, bi) => {
+                      if (block.kind === "title") {
+                        return (
+                          <p
+                            key={bi}
+                            data-block-idx={bi}
+                            data-seg-idx={block.segIdx}
+                            data-phrase-idx={0}
+                            onClick={() => seekTo(script.segments![block.segIdx].startSec)}
+                            className="mb-6 mt-2 cursor-pointer text-center font-sans text-sm font-medium uppercase tracking-wide text-muted-foreground"
+                          >
+                            {block.text}
+                          </p>
+                        );
+                      }
+                      if (block.kind === "sfx") {
+                        const seg = script.segments![block.segIdx];
+                        const active = block.segIdx === activeIdx;
+                        return (
+                          <div
+                            key={bi}
+                            data-block-idx={bi}
+                            data-seg-idx={block.segIdx}
+                            data-phrase-idx={0}
+                            onClick={() => seekTo(seg.startSec)}
+                            className={cn(
+                              "my-5 flex cursor-pointer items-center justify-center gap-2 font-sans text-xs",
+                              active ? "text-foreground" : "text-muted-foreground"
+                            )}
+                          >
+                            <Volume2 className="h-3 w-3 shrink-0" />
+                            <span className="italic">{seg.text}</span>
+                          </div>
+                        );
+                      }
+                      return (
+                        <p key={bi} data-block-idx={bi} className="my-4">
+                          {block.pieces.map((p, pi) => {
+                            const seg = script.segments![p.segIdx];
+                            const phrase = seg.phrases[p.phraseIdx];
+                            const active =
+                              p.segIdx === activeIdx && p.phraseIdx === activePhraseIdx;
+                            const color =
+                              seg.kind === "dialogue" ? speakerColor(seg.characterId) : undefined;
+                            return (
+                              <Fragment key={pi}>
+                                {p.label && (
+                                  <span
+                                    className="mr-1.5 font-sans text-xs font-medium"
+                                    style={{ color }}
+                                  >
+                                    {p.label}
+                                  </span>
+                                )}
+                                <span
+                                  data-seg-idx={p.segIdx}
+                                  data-phrase-idx={p.phraseIdx}
+                                  onClick={() => seekTo(phrase.startSec)}
+                                  title={seg.kind === "dialogue" ? seg.characterName : undefined}
+                                  style={{ color }}
+                                  className={cn(
+                                    "cursor-pointer rounded-sm transition-colors duration-200",
+                                    active ? "bg-primary/25 text-foreground" : "hover:bg-muted",
+                                    seg.kind === "narration" && !active && "text-foreground/80"
+                                  )}
+                                >
+                                  {p.text}
+                                </span>
+                              </Fragment>
+                            );
+                          })}
+                        </p>
+                      );
+                    })}
+                  </div>
+                </div>
+                {pageCount > 1 && (
+                  <div className="mt-2 flex items-center justify-center gap-4 text-sm text-muted-foreground">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8"
+                      onClick={() => goToPage(currentPage - 1)}
+                      disabled={currentPage === 0}
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                    </Button>
+                    <span className="tabular-nums">
+                      Page {currentPage + 1} of {pageCount}
+                    </span>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8"
+                      onClick={() => goToPage(currentPage + 1)}
+                      disabled={currentPage >= pageCount - 1}
+                    >
+                      <ChevronRight className="h-4 w-4" />
+                    </Button>
+                  </div>
+                )}
+              </>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      <Card
+        className={cn(
+          "z-30 border-primary/20 bg-card/95 backdrop-blur",
+          !showReader && "sticky top-16"
+        )}
+      >
         <CardContent className="space-y-3 py-4">
           <div className="flex items-center justify-between">
             <div className="min-w-0">
@@ -477,106 +652,6 @@ export function ListenTab({
           </div>
         </CardContent>
       </Card>
-
-      {readAlong && current && current.id !== INTRO_ID && (
-        <Card>
-          <CardContent className="py-4">
-            {!script || script.chapterId !== current.id ? (
-              <div className="flex items-center justify-center gap-2 py-10 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" /> Loading script…
-              </div>
-            ) : script.error ? (
-              <p className="py-8 text-center text-sm text-muted-foreground">{script.error}</p>
-            ) : (
-              <div
-                ref={scrollRef}
-                onScroll={() => {
-                  if (!autoScrollRef.current.active) userScrolledAtRef.current = Date.now();
-                }}
-                onScrollEnd={() => {
-                  autoScrollRef.current.active = false;
-                }}
-                className="max-h-[65vh] overflow-y-auto"
-              >
-                <div className="mx-auto max-w-[65ch] px-2 font-serif text-[17px] leading-8 text-foreground/90">
-                  {blocks.map((block, bi) => {
-                    if (block.kind === "title") {
-                      return (
-                        <p
-                          key={bi}
-                          data-seg-idx={block.segIdx}
-                          data-phrase-idx={0}
-                          onClick={() => seekTo(script.segments![block.segIdx].startSec)}
-                          className="mb-6 mt-2 cursor-pointer text-center font-sans text-sm font-medium uppercase tracking-wide text-muted-foreground"
-                        >
-                          {block.text}
-                        </p>
-                      );
-                    }
-                    if (block.kind === "sfx") {
-                      const seg = script.segments![block.segIdx];
-                      const active = block.segIdx === activeIdx;
-                      return (
-                        <div
-                          key={bi}
-                          data-seg-idx={block.segIdx}
-                          data-phrase-idx={0}
-                          onClick={() => seekTo(seg.startSec)}
-                          className={cn(
-                            "my-5 flex cursor-pointer items-center justify-center gap-2 font-sans text-xs",
-                            active ? "text-foreground" : "text-muted-foreground"
-                          )}
-                        >
-                          <Volume2 className="h-3 w-3 shrink-0" />
-                          <span className="italic">{seg.text}</span>
-                        </div>
-                      );
-                    }
-                    return (
-                      <p key={bi} className="my-4">
-                        {block.pieces.map((p, pi) => {
-                          const seg = script.segments![p.segIdx];
-                          const phrase = seg.phrases[p.phraseIdx];
-                          const active =
-                            p.segIdx === activeIdx && p.phraseIdx === activePhraseIdx;
-                          const color =
-                            seg.kind === "dialogue" ? speakerColor(seg.characterId) : undefined;
-                          return (
-                            <Fragment key={pi}>
-                              {p.label && (
-                                <span
-                                  className="mr-1.5 font-sans text-xs font-medium"
-                                  style={{ color }}
-                                >
-                                  {p.label}
-                                </span>
-                              )}
-                              <span
-                                data-seg-idx={p.segIdx}
-                                data-phrase-idx={p.phraseIdx}
-                                onClick={() => seekTo(phrase.startSec)}
-                                title={seg.kind === "dialogue" ? seg.characterName : undefined}
-                                style={{ color }}
-                                className={cn(
-                                  "cursor-pointer rounded-sm transition-colors duration-200",
-                                  active ? "bg-primary/25 text-foreground" : "hover:bg-muted",
-                                  seg.kind === "narration" && !active && "text-foreground/80"
-                                )}
-                              >
-                                {p.text}
-                              </span>
-                            </Fragment>
-                          );
-                        })}
-                      </p>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      )}
 
       <div className="flex items-center justify-between">
         <p className="text-sm text-muted-foreground">

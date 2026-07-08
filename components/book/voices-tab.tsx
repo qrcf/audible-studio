@@ -44,13 +44,13 @@ export function VoicesTab({
   elevenReady,
   onRecast,
   casting,
-  busy,
+  castRunning,
 }: {
   characters: CharacterData[];
   elevenReady: boolean;
   onRecast: () => void;
   casting: boolean;
-  busy: boolean;
+  castRunning: boolean;
 }) {
   const router = useRouter();
   const readOnly = useReadOnly();
@@ -196,7 +196,7 @@ export function VoicesTab({
     <div className="space-y-4">
       {!readOnly && (
       <div className="flex items-center justify-end">
-        <Button variant="outline" onClick={onRecast} disabled={busy}>
+        <Button variant="outline" onClick={onRecast} disabled={castRunning}>
           {casting ? (
             <Loader2 className="h-4 w-4 animate-spin" />
           ) : (

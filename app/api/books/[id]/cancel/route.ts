@@ -3,6 +3,7 @@ import { getRun } from "workflow/api";
 import { getDb, books, characters, jobs } from "@/lib/db";
 import { errorResponse, AppError } from "@/lib/errors";
 import { cancelBookJobs } from "@/lib/jobs";
+import { refreshBookStatus } from "@/lib/generation";
 
 /**
  * Cancel everything in flight for a book: running jobs flip to "cancelled"
@@ -42,6 +43,10 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
         .update(books)
         .set({ status: hasCharacters ? "analyzed" : "parsed", error: null })
         .where(eq(books.id, id));
+    } else if (book.status === "generating") {
+      // No queued/running generate jobs remain, so this settles to ready/cast
+      // (running chapters still unwind themselves and re-settle after).
+      await refreshBookStatus(id);
     }
 
     return Response.json({ cancelled });

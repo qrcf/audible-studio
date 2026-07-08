@@ -1,17 +1,37 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, lt, sql } from "drizzle-orm";
+import { and, eq, inArray, lt, sql } from "drizzle-orm";
 import { getRun } from "workflow/api";
 import { getDb, jobs } from "@/lib/db";
 import type { JobStatus } from "@/lib/db/schema";
 import { JobCancelledError } from "@/lib/errors";
 
+export type JobType = "analyze" | "cast" | "script" | "generate" | "intro";
+
 export async function createJob(
-  type: "analyze" | "cast" | "script" | "generate" | "intro",
+  type: JobType,
   bookId: string,
   chapterId?: string
 ): Promise<string> {
   const id = randomUUID();
   await getDb().insert(jobs).values({ id, type, bookId, chapterId: chapterId ?? null });
+  return id;
+}
+
+/**
+ * Enqueue a job for the bounded dispatcher (lib/queue.ts) to start later.
+ * Inserted as "queued" (vs createJob's immediate "running"); `scriptFirst`
+ * asks the generate workflow to script the chapter first when it has no script.
+ */
+export async function enqueueJob(
+  type: JobType,
+  bookId: string,
+  chapterId: string,
+  opts: { scriptFirst?: boolean } = {}
+): Promise<string> {
+  const id = randomUUID();
+  await getDb()
+    .insert(jobs)
+    .values({ id, type, bookId, chapterId, status: "queued", scriptFirst: opts.scriptFirst ?? false });
   return id;
 }
 
@@ -96,21 +116,23 @@ export async function failJob(id: string, error: unknown): Promise<void> {
     .where(and(eq(jobs.id, id), eq(jobs.status, "running")));
 }
 
+// Queued jobs can be cancelled too (they simply never start); running jobs
+// flip and their workflow observes the flag at the next safe point.
 export async function cancelJob(id: string): Promise<boolean> {
   const cancelled = await getDb()
     .update(jobs)
     .set({ status: "cancelled", note: null, updatedAt: new Date() })
-    .where(and(eq(jobs.id, id), eq(jobs.status, "running")))
+    .where(and(eq(jobs.id, id), inArray(jobs.status, ["running", "queued"])))
     .returning({ id: jobs.id });
   return cancelled.length > 0;
 }
 
-/** Cancel every running job for a book; returns how many were cancelled. */
+/** Cancel every running or queued job for a book; returns how many were cancelled. */
 export async function cancelBookJobs(bookId: string): Promise<number> {
   const cancelled = await getDb()
     .update(jobs)
     .set({ status: "cancelled", note: null, updatedAt: new Date() })
-    .where(and(eq(jobs.bookId, bookId), eq(jobs.status, "running")))
+    .where(and(eq(jobs.bookId, bookId), inArray(jobs.status, ["running", "queued"])))
     .returning({ id: jobs.id });
   return cancelled.length;
 }

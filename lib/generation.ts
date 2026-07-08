@@ -1,5 +1,5 @@
 import { and, eq, inArray } from "drizzle-orm";
-import { getDb, books, chapters, characters, segments, voiceAssignments } from "@/lib/db";
+import { getDb, books, chapters, characters, jobs, segments, voiceAssignments } from "@/lib/db";
 import type { VoiceSettings } from "@/lib/db/schema";
 import {
   applyDeliveryToSettings,
@@ -116,6 +116,23 @@ export async function chapterIdToBookId(chapterId: string): Promise<string> {
 export async function refreshBookStatus(bookId: string): Promise<void> {
   if (!bookId) return;
   const db = getDb();
+  // Queued/running generation still owns the book — don't let a lull between
+  // chapters (some queued, none momentarily rendering) downgrade the badge.
+  const active = await db
+    .select({ id: jobs.id })
+    .from(jobs)
+    .where(
+      and(
+        eq(jobs.bookId, bookId),
+        eq(jobs.type, "generate"),
+        inArray(jobs.status, ["queued", "running"])
+      )
+    )
+    .limit(1);
+  if (active.length > 0) {
+    await db.update(books).set({ status: "generating" }).where(eq(books.id, bookId));
+    return;
+  }
   const statuses = (
     await db.select({ status: chapters.status }).from(chapters).where(eq(chapters.bookId, bookId))
   ).map((c) => c.status);

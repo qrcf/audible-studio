@@ -40,7 +40,7 @@ export type ChapterStatus =
   | "stale"
   | "error";
 
-export type JobStatus = "running" | "completed" | "failed" | "cancelled";
+export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 
 export interface NarratorProfile {
   description: string;
@@ -202,6 +202,9 @@ export const jobs = pgTable(
     error: text("error"),
     // Workflow run executing this job, for cancellation/reconciliation
     runId: text("run_id"),
+    // Queue metadata: a "queued" generate job with this set scripts the chapter
+    // (script-if-needed) before rendering — used by the generate-all path.
+    scriptFirst: boolean("script_first").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
       .notNull()
       .defaultNow(),
@@ -209,7 +212,11 @@ export const jobs = pgTable(
       .notNull()
       .defaultNow(),
   },
-  (t) => [index("jobs_book_status_idx").on(t.bookId, t.status)]
+  (t) => [
+    index("jobs_book_status_idx").on(t.bookId, t.status),
+    // The dispatcher claims oldest-queued-first per type; this keeps it cheap.
+    index("jobs_type_status_created_idx").on(t.type, t.status, t.createdAt),
+  ]
 );
 
 export const voiceCatalogSnapshots = pgTable("voice_catalog_snapshots", {

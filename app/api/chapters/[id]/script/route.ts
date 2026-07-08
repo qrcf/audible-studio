@@ -1,9 +1,8 @@
-import { eq } from "drizzle-orm";
-import { start } from "workflow/api";
-import { getDb, chapters } from "@/lib/db";
+import { and, eq, inArray } from "drizzle-orm";
+import { getDb, chapters, jobs } from "@/lib/db";
 import { errorResponse, AppError, requireEnv } from "@/lib/errors";
-import { attachRunId, createJob } from "@/lib/jobs";
-import { scriptChapterWorkflow } from "@/workflows/script-chapter";
+import { enqueueJob } from "@/lib/jobs";
+import { dispatchAll } from "@/lib/queue";
 
 export async function POST(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -15,11 +14,18 @@ export async function POST(_req: Request, { params }: { params: Promise<{ id: st
     if (chapter.status === "scripting" || chapter.status === "generating") {
       throw new AppError("Chapter is busy", "busy", 409);
     }
+    const dup = await db
+      .select({ id: jobs.id })
+      .from(jobs)
+      .where(
+        and(eq(jobs.chapterId, id), eq(jobs.type, "script"), inArray(jobs.status, ["queued", "running"]))
+      )
+      .limit(1);
+    if (dup.length > 0) throw new AppError("Chapter is already queued", "busy", 409);
 
-    const jobId = await createJob("script", chapter.bookId, id);
-    await db.update(chapters).set({ status: "scripting", error: null }).where(eq(chapters.id, id));
-    const run = await start(scriptChapterWorkflow, [id, jobId]);
-    await attachRunId(jobId, run.runId);
+    // Enqueue into the script pool; a single click starts immediately (under cap).
+    const jobId = await enqueueJob("script", chapter.bookId, id);
+    await dispatchAll();
     return Response.json({ jobId });
   } catch (err) {
     return errorResponse(err);

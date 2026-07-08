@@ -4,7 +4,9 @@ import { jwtVerify } from "jose";
 // Single-user passkey gate: everything except the login flow and share-link
 // redemption requires the session cookie minted by /api/auth/*. Share-link
 // viewers carry a separate `share_session` cookie (see viewerGate).
-const PUBLIC_PREFIXES = ["/login", "/api/auth/", "/share/"];
+// `/api/internal/` carries no session (it's the queue's server-to-server
+// dispatch ping); it authenticates itself with DISPATCH_SECRET in-route.
+const PUBLIC_PREFIXES = ["/login", "/api/auth/", "/share/", "/api/internal/"];
 
 export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;

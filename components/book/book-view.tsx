@@ -13,8 +13,8 @@ import { ModelPrefsPopover } from "./model-prefs-popover";
 import { EditBookDialog } from "./edit-book-dialog";
 import { ShareDialog } from "./share-dialog";
 import { ReadOnlyProvider } from "./read-only";
-import { PipelineCard } from "./pipeline-card";
-import { ProgressStrip } from "./progress-strip";
+import { GuidedGate } from "./guided-gate";
+import { ActivityDock } from "./activity-dock";
 import { CharactersTab } from "./characters-tab";
 import { VoicesTab } from "./voices-tab";
 import { ChaptersTab } from "./chapters-tab";
@@ -67,17 +67,23 @@ export function BookView({
     () => progress?.jobs.filter((j) => j.status === "running") ?? [],
     [progress]
   );
+  // Everything in flight OR waiting — the dock and per-chapter rows show both.
+  const activeJobs = useMemo(
+    () => progress?.jobs.filter((j) => j.status === "running" || j.status === "queued") ?? [],
+    [progress]
+  );
   const jobsLoaded = progress !== null;
   const introJob = useMemo(
     () => runningJobs.find((j) => j.type === "intro") ?? null,
     [runningJobs]
   );
-  const busy =
-    ["analyzing", "casting", "generating"].includes(liveBookStatus) ||
-    liveChapters.some((c) => ["scripting", "generating"].includes(c.status)) ||
-    runningJobs.length > 0 ||
-    analyzing ||
-    casting;
+
+  // No global lock anymore — each action gates only on its OWN operation, so you
+  // can script one chapter while another generates, re-cast while audio drains,
+  // etc. Generation is bounded by the queue; the rest run in parallel.
+  const analyzeRunning = analyzing || runningJobs.some((j) => j.type === "analyze");
+  const castRunning = casting || runningJobs.some((j) => j.type === "cast");
+  const generateActive = activeJobs.some((j) => j.type === "generate");
 
   useEffect(() => {
     // Nothing changes for a read-only viewer — skip the polling/refresh loop.
@@ -195,7 +201,10 @@ export function BookView({
   const allAssigned = hasCharacters && characters.every((c) => c.assignment);
 
   const primaryAction = livePipelineStage ? null : !hasCharacters ? (
-    <Button onClick={startPipeline} disabled={busy || starting || !keys.anthropic}>
+    <Button
+      onClick={startPipeline}
+      disabled={starting || analyzeRunning || castRunning || !keys.anthropic}
+    >
       {starting || liveBookStatus === "analyzing" ? (
         <Loader2 className="h-4 w-4 animate-spin" />
       ) : (
@@ -204,14 +213,14 @@ export function BookView({
       Run guided setup
     </Button>
   ) : !allAssigned ? (
-    <Button onClick={cast} disabled={busy || !keys.anthropic || !keys.eleven}>
+    <Button onClick={cast} disabled={castRunning || !keys.anthropic || !keys.eleven}>
       {casting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
       Auto-cast voices
     </Button>
   ) : (
     <Button
       onClick={generateAll}
-      disabled={busy || !keys.eleven || liveChapters.every((c) => c.status === "ready")}
+      disabled={generateActive || !keys.eleven || liveChapters.every((c) => c.status === "ready")}
     >
       {liveBookStatus === "generating" ? (
         <Loader2 className="h-4 w-4 animate-spin" />
@@ -222,13 +231,15 @@ export function BookView({
     </Button>
   );
 
-  const defaultTab = !hasCharacters
-    ? "characters"
-    : !allAssigned
-      ? "voices"
-      : liveChapters.some((c) => c.status === "ready")
-        ? "listen"
-        : "chapters";
+  const defaultTab = readOnly
+    ? "listen"
+    : !hasCharacters
+      ? "characters"
+      : !allAssigned
+        ? "voices"
+        : liveChapters.some((c) => c.status === "ready")
+          ? "listen"
+          : "chapters";
 
   const bookError = progress?.book.error ?? book.error;
 
@@ -255,7 +266,11 @@ export function BookView({
               <ShareDialog bookId={book.id} initialToken={shareToken} />
               <ModelPrefsPopover book={book} />
               {!livePipelineStage && hasCharacters && (
-                <Button variant="outline" onClick={startPipeline} disabled={busy || starting}>
+                <Button
+                  variant="outline"
+                  onClick={startPipeline}
+                  disabled={starting || analyzeRunning || castRunning}
+                >
                   {starting ? (
                     <Loader2 className="h-4 w-4 animate-spin" />
                   ) : (
@@ -271,7 +286,7 @@ export function BookView({
       </div>
 
       {!readOnly && livePipelineStage && (
-        <PipelineCard
+        <GuidedGate
           bookId={book.id}
           stage={livePipelineStage}
           bookStatus={liveBookStatus}
@@ -286,8 +301,8 @@ export function BookView({
         />
       )}
 
-      {!readOnly && !livePipelineStage && runningJobs.length > 0 && (
-        <ProgressStrip jobs={runningJobs} chapters={liveChapters} />
+      {!readOnly && activeJobs.length > 0 && (
+        <ActivityDock jobs={activeJobs} chapters={liveChapters} onCancelAll={cancelAll} />
       )}
 
       {bookError && liveBookStatus === "error" && !livePipelineStage && (
@@ -310,8 +325,7 @@ export function BookView({
             bookStatus={liveBookStatus}
             analyzeJob={runningJobs.find((j) => j.type === "analyze") ?? null}
             onAnalyze={analyze}
-            onCancel={cancelAll}
-            canAnalyze={keys.anthropic && !busy}
+            canAnalyze={keys.anthropic && !analyzeRunning}
           />
         </TabsContent>
         <TabsContent value="voices" className="mt-4">
@@ -320,7 +334,7 @@ export function BookView({
             elevenReady={keys.eleven}
             onRecast={cast}
             casting={casting}
-            busy={busy}
+            castRunning={castRunning}
           />
         </TabsContent>
         <TabsContent value="chapters" className="mt-4">
@@ -328,8 +342,8 @@ export function BookView({
             book={book}
             chapters={liveChapters}
             characters={characters}
-            jobs={runningJobs}
-            busy={busy}
+            jobs={activeJobs}
+            generateActive={generateActive}
             keys={keys}
             onGenerateAll={generateAll}
           />

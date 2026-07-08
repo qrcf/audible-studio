@@ -44,14 +44,12 @@ export function CharactersTab({
   bookStatus,
   analyzeJob,
   onAnalyze,
-  onCancel,
   canAnalyze,
 }: {
   characters: CharacterData[];
   bookStatus: string;
   analyzeJob: JobData | null;
   onAnalyze: () => void;
-  onCancel: () => void;
   canAnalyze: boolean;
 }) {
   const router = useRouter();
@@ -74,25 +72,19 @@ export function CharactersTab({
     }
   }
 
-  if (bookStatus === "analyzing" || analyzeJob) {
-    const pct =
-      analyzeJob && analyzeJob.total > 0
-        ? Math.round((analyzeJob.done / analyzeJob.total) * 100)
-        : null;
+  // First-time analysis with no cast yet: a compact reassurance, no giant
+  // takeover — live progress + cancel now live in the activity dock above.
+  if ((bookStatus === "analyzing" || analyzeJob) && characters.length === 0) {
     return (
       <Card>
-        <CardContent className="flex flex-col items-center gap-4 py-16 text-center">
-          <Loader2 className="h-8 w-8 animate-spin text-primary" />
+        <CardContent className="flex flex-col items-center gap-3 py-10 text-center">
+          <Loader2 className="h-6 w-6 animate-spin text-primary" />
           <div>
             <p className="font-medium">Reading the book…</p>
             <p className="text-sm text-muted-foreground">
               {analyzeJob?.note ?? "Finding characters and the narrator's voice"}
             </p>
           </div>
-          {pct !== null && <Progress value={pct} className="w-64" />}
-          <Button variant="outline" size="sm" onClick={onCancel}>
-            Cancel analysis
-          </Button>
         </CardContent>
       </Card>
     );

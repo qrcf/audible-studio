@@ -1,7 +1,6 @@
 import { createHash } from "node:crypto";
 import { asc, eq } from "drizzle-orm";
 import { FatalError, RetryableError, getStepMetadata } from "workflow";
-import { resumeHook } from "workflow/api";
 import { getDb, books, chapters, characters, segments } from "@/lib/db";
 import {
   CONTEXT_CHARS,
@@ -359,13 +358,4 @@ export async function failChapter(
     .set({ status: "error", error: message })
     .where(eq(chapters.id, chapterId));
   await refreshBookStatus(bookId);
-}
-
-/** Child runs report their outcome to the waiting generate-book parent. */
-export async function notifyParent(
-  token: string,
-  outcome: "ready" | "cancelled" | "failed"
-): Promise<void> {
-  "use step";
-  await resumeHook(token, { outcome });
 }
