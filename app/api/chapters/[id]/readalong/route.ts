@@ -3,13 +3,14 @@ import { getDb, chapters, characters, segments } from "@/lib/db";
 import { errorResponse, AppError } from "@/lib/errors";
 import { viewerDeniedForBook } from "@/lib/auth/session";
 import { cleanChapterText, titleAnnouncement } from "@/lib/analysis/clean";
+import { deriveSegmentBoundaries } from "@/lib/analysis/boundaries";
 
 /**
- * The chapter MP3 is a CBR byte-concatenation of the per-segment audio, and
- * each segment's exact duration was captured at generation time
- * (segments.durationSec) — start times are pure addition, no audio reads.
- * Timing stays valid for stale chapters too (their audio was built from
- * these same segments).
+ * The chapter MP3 is a CBR byte-concatenation of the per-segment audio plus
+ * the silence finalize inserted between segments, and both lengths were
+ * captured at generation time (segments.durationSec / pauseBeforeSec) — start
+ * times are pure addition, no audio reads. Timing stays valid for stale
+ * chapters too (their audio was built from these same segments).
  */
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -40,20 +41,18 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       ).map((c) => [c.id, c.name])
     );
 
-    // Segment texts are ordered (near-)exact substrings of the cleaned chapter
-    // text, so a monotonic indexOf walk recovers each segment's position and
-    // whether a paragraph break sits in the trimmed gap before it. The spoken
-    // title announcement and sfx rows aren't part of the chapter text.
-    const cleaned = cleanChapterText(chapter.text, chapter.title);
-    const announcement = titleAnnouncement(chapter.title);
-    let cursor = 0;
-    let anyMatched = false;
+    const bounds = deriveSegmentBoundaries(
+      cleanChapterText(chapter.text, chapter.title),
+      titleAnnouncement(chapter.title),
+      segs
+    );
 
     // The book intro is its own section now (not prepended here), so chapter
     // segment timing starts at 0. (introDurationSec stays null on chapters.)
     let startSec = chapter.introDurationSec ?? 0;
     const timed = [];
-    for (const seg of segs) {
+    for (let i = 0; i < segs.length; i++) {
+      const seg = segs[i];
       if (!seg.audioPath || seg.durationSec == null) {
         // Re-scripted since generation — the chapter audio no longer matches
         throw new AppError(
@@ -62,27 +61,10 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
           409
         );
       }
-      const isTitle = seg.kind === "narration" && seg.text === announcement;
-      let paraBreakBefore = true;
-      // Whitespace between adjacent segments was trimmed at storage, so
-      // recover whether an inline space belongs before this segment (else
-      // `"Well now,"he rumbled` renders with no gap).
-      let spaceBefore = false;
-      if (seg.kind !== "sfx" && !isTitle) {
-        const at = cleaned.indexOf(seg.text, cursor);
-        if (at >= 0) {
-          const gap = cleaned.slice(cursor, at);
-          paraBreakBefore = !anyMatched || /\n\s*\n/.test(gap);
-          spaceBefore = !paraBreakBefore && gap.length > 0;
-          cursor = at + seg.text.length;
-          anyMatched = true;
-        } else {
-          // Merged-dialogue " " insert or \n\n\n rejoin — degrade gracefully
-          paraBreakBefore = seg.kind === "narration";
-          spaceBefore = !paraBreakBefore;
-        }
-      }
+      const { paraBreakBefore, spaceBefore, isTitle } = bounds[i];
       const durationSec = seg.durationSec;
+      // Null on chapters finalized before pauses existed — those are gapless.
+      startSec += seg.pauseBeforeSec ?? 0;
       timed.push({
         id: seg.id,
         idx: seg.idx,

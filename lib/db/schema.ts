@@ -175,6 +175,10 @@ export const segments = pgTable(
     // Exact playback length, captured from the rendered buffer at generation
     // time (read-along timing reads this instead of re-measuring audio)
     durationSec: doublePrecision("duration_sec"),
+    // Silence spliced in before this segment when the chapter was stitched
+    // (finalizeChapter). Null = 0: chapters finalized before pauses existed
+    // are gapless.
+    pauseBeforeSec: doublePrecision("pause_before_sec"),
     flagged: boolean("flagged").notNull().default(false),
     delivery: text("delivery").$type<Delivery>(),
     sfxDurationSec: doublePrecision("sfx_duration_sec"),

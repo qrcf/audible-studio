@@ -1,0 +1,1 @@
+ALTER TABLE "segments" ADD COLUMN "pause_before_sec" double precision;

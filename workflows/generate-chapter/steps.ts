@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { asc, eq } from "drizzle-orm";
+import { asc, eq, sql } from "drizzle-orm";
 import { FatalError, RetryableError, getStepMetadata } from "workflow";
 import { getDb, books, chapters, characters, segments } from "@/lib/db";
 import {
@@ -14,9 +14,11 @@ import { ttsConvert, splitForModel } from "@/lib/elevenlabs/tts";
 import { soundEffect } from "@/lib/elevenlabs/sfx";
 import { ensureBookIntro } from "@/lib/intro";
 import { estimateSfxCredits } from "@/lib/format";
-import { concatMp3, segmentAudioDurationSec } from "@/lib/audio/mp3";
+import { concatMp3, measureEdgeSilence, segmentAudioDurationSec, silenceMp3 } from "@/lib/audio/mp3";
+import { targetPauseSec } from "@/lib/audio/pauses";
 import { isV3, pauseSuffix } from "@/lib/delivery";
-import { titleAnnouncement } from "@/lib/analysis/clean";
+import { cleanChapterText, titleAnnouncement } from "@/lib/analysis/clean";
+import { deriveSegmentBoundaries } from "@/lib/analysis/boundaries";
 import {
   chapterAudioPath,
   deleteBlobs,
@@ -294,7 +296,13 @@ export async function finalizeChapter(chapterId: string, jobId: string): Promise
   const [chapter] = await db.select().from(chapters).where(eq(chapters.id, chapterId)).limit(1);
   if (!chapter) throw new FatalError("Chapter not found");
   const segs = await db
-    .select({ audioPath: segments.audioPath })
+    .select({
+      id: segments.id,
+      kind: segments.kind,
+      text: segments.text,
+      characterId: segments.characterId,
+      audioPath: segments.audioPath,
+    })
     .from(segments)
     .where(eq(segments.chapterId, chapterId))
     .orderBy(asc(segments.idx));
@@ -306,15 +314,59 @@ export async function finalizeChapter(chapterId: string, jobId: string): Promise
   }
 
   // Chapter audio is speech segments only — the intro is its own section.
-  const { data, durationSec } = concatMp3(buffers);
+  // Between segments, splice in silence sized by the text at the boundary
+  // (paragraph break > sentence > clause > mid-sentence), minus the edge
+  // silence the clips already carry so the perceived gap stays consistent.
+  const bounds = deriveSegmentBoundaries(
+    cleanChapterText(chapter.text, chapter.title),
+    titleAnnouncement(chapter.title),
+    segs
+  );
+  const edges: { leadSec: number; tailSec: number }[] = [];
+  for (const buf of buffers) edges.push(await measureEdgeSilence(buf));
+
+  const parts: Buffer[] = [];
+  const pauses = new Array<number>(segs.length).fill(0);
+  for (let i = 0; i < segs.length; i++) {
+    if (i > 0) {
+      const target = targetPauseSec({
+        prev: segs[i - 1],
+        cur: segs[i],
+        paraBreakBefore: bounds[i].paraBreakBefore,
+        prevIsTitle: bounds[i - 1].isTitle,
+      });
+      const { data, sec } = silenceMp3(target - edges[i - 1].tailSec - edges[i].leadSec);
+      if (data.length > 0) {
+        parts.push(data);
+        pauses[i] = sec;
+      }
+    }
+    parts.push(buffers[i]);
+  }
+
+  const { data, durationSec } = concatMp3(parts);
   const contentHash = createHash("sha256").update(data).digest("hex").slice(0, 12);
   const chapterRel = chapterAudioPath(chapter.bookId, chapter.idx, contentHash);
   await writeAudio(chapterRel, data);
 
-  await db
-    .update(chapters)
-    .set({ status: "ready", audioPath: chapterRel, durationSec, introDurationSec: null, error: null })
-    .where(eq(chapters.id, chapterId));
+  // One transaction: read-along must never see the new audio with old pause
+  // values (or vice versa). Every row is written so a re-finalize under a
+  // retuned pause policy fully overwrites the old values.
+  await db.transaction(async (tx) => {
+    if (segs.length > 0) {
+      const rows = sql.join(
+        segs.map((seg, i) => sql`(${seg.id}, ${pauses[i]}::double precision)`),
+        sql`, `
+      );
+      await tx.execute(
+        sql`update segments set pause_before_sec = v.pause from (values ${rows}) as v(id, pause) where segments.id = v.id`
+      );
+    }
+    await tx
+      .update(chapters)
+      .set({ status: "ready", audioPath: chapterRel, durationSec, introDurationSec: null, error: null })
+      .where(eq(chapters.id, chapterId));
+  });
   // The old version is unreachable once the row points at the new blob
   if (chapter.audioPath && chapter.audioPath !== chapterRel) {
     await deleteBlobs(chapter.audioPath);

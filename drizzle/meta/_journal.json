@@ -43,6 +43,13 @@
       "when": 1783551651804,
       "tag": "0005_deep_squirrel_girl",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1783554911534,
+      "tag": "0006_lying_christian_walker",
+      "breakpoints": true
     }
   ]
 }
